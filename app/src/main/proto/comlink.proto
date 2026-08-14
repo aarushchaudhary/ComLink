@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package com.aarushchaudhary.comlink.proto;
+
+message Envelope {
+  // SHA-256 hash or device ID of the sender (to route messages)
+  string sender_id = 1;
+  
+  // SHA-256 hash or device ID of the recipient
+  string recipient_id = 2;
+  
+  // Encrypted AES-256-GCM payload
+  bytes ciphertext = 3;
+  
+  // 96-bit deterministic nonce (session salt + direction + counter)
+  bytes nonce = 4;
+  
+  // Unix timestamp of message generation
+  int64 timestamp = 5;
+  
+  // Unique identifier to prevent broadcast storms (LRU cache)
+  string envelope_id = 6;
+  
+  // Multi-hop time-to-live counter
+  int32 ttl = 7;
+}
