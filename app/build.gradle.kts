@@ -63,6 +63,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     
     // Compose
     implementation(platform("androidx.compose:compose-bom:$composeBomVersion"))
