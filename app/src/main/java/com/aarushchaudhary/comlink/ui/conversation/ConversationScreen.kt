@@ -94,7 +94,14 @@ fun ConversationScreen(
                                 
                                 Text(msg.plaintext, fontSize = 16.sp)
                                 
-                                val tickStr = if (msg.isFromMe) { if (msg.status == 1) " ✓✓" else " ✓" } else ""
+                                val tickStr = if (msg.isFromMe) {
+                                    when (msg.status) {
+                                        0 -> " 🕒"
+                                        1 -> " ✓"
+                                        2 -> " ✓✓"
+                                        else -> ""
+                                    }
+                                } else ""
                                 Text(
                                     text = formatTimestamp(msg.timestamp) + tickStr, 
                                     fontSize = 10.sp, 

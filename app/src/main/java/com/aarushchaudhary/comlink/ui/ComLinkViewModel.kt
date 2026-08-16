@@ -70,7 +70,10 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                     ttl = 10
                 )
                 currentCounter++
-                router.sendLocalMessage(envelope)
+                val success = router.sendLocalMessage(envelope)
+                if (success) {
+                    dao.updateMessageStatus(msg.messageId, 1)
+                }
             }
             dao.updateMyCounter(peerId, currentCounter)
         }
@@ -173,7 +176,10 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             )
             dao.insertMessage(msgEntity)
             
-            router.sendLocalMessage(envelope)
+            val success = router.sendLocalMessage(envelope)
+            if (success) {
+                dao.updateMessageStatus(envId, 1)
+            }
         }
     }
 
@@ -208,7 +214,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 val plaintext = String(decryptedBytes, Charsets.UTF_8)
                 if (plaintext.startsWith("ACK:")) {
                     val ackedId = plaintext.substringAfter("ACK:")
-                    dao.updateMessageStatus(ackedId, 1) // 1 = Delivered
+                    dao.updateMessageStatus(ackedId, 2) // 2 = Delivered
                     return@launch
                 }
                 

@@ -4,6 +4,8 @@ import android.util.Log
 import com.aarushchaudhary.comlink.proto.Envelope
 import java.util.Collections
 import java.util.LinkedHashMap
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 
 class MeshRouter(val localDeviceId: String) {
 
@@ -11,7 +13,7 @@ class MeshRouter(val localDeviceId: String) {
     var onMessageReceived: ((Envelope) -> Unit)? = null
     
     // Callback to physically broadcast an envelope to all active Bluetooth connections
-    var broadcastToNetwork: ((ByteArray) -> Unit)? = null
+    var broadcastToNetwork: (suspend (ByteArray) -> Boolean)? = null
 
     // LRU Cache to prevent broadcast storms (Max 10,000 envelope IDs)
     private val seenEnvelopes = Collections.synchronizedMap(
@@ -53,19 +55,21 @@ class MeshRouter(val localDeviceId: String) {
                 // Rebuild envelope with decremented TTL
                 val relayedEnvelope = envelope.copy(ttl = newTtl)
                 val encodedBytes = relayedEnvelope.encode()
-                
-                // Broadcast to all connected sockets
-                broadcastToNetwork?.invoke(encodedBytes)
+                // Broadcast to all connected sockets in background
+                kotlinx.coroutines.GlobalScope.launch {
+                    broadcastToNetwork?.invoke(encodedBytes)
+                }
             }
         }
     }
 
     /**
      * Submits a newly created local envelope to the mesh network.
+     * Returns true if transmitted successfully.
      */
-    fun sendLocalMessage(envelope: Envelope) {
+    suspend fun sendLocalMessage(envelope: Envelope): Boolean {
         // Record it so we don't rebroadcast it if it echoes back
         seenEnvelopes[envelope.envelope_id] = true
-        broadcastToNetwork?.invoke(envelope.encode())
+        return broadcastToNetwork?.invoke(envelope.encode()) ?: false
     }
 }

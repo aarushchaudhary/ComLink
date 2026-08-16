@@ -58,29 +58,26 @@ class BluetoothService(
     // Map of Packet ID to MessageBuffer
     private val rxBuffers = ConcurrentHashMap<Int, MessageBuffer>()
 
-    // Concurrency protection: sequential FIFO queue for each GATT client
+    // Concurrency protection: Mutex for sequential characteristic writes
     private inner class GattConnection(val gatt: BluetoothGatt) {
-        val writeChannel = Channel<ByteArray>(Channel.UNLIMITED)
+        val writeMutex = kotlinx.coroutines.sync.Mutex()
         val writeCompleted = Channel<Unit>(1)
 
-        init {
-            serviceScope.launch {
-                for (chunk in writeChannel) {
-                    val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
-                    if (characteristic != null) {
-                        characteristic.value = chunk
-                        // BitChat pattern: WRITE_TYPE_NO_RESPONSE for speed, but wait for callback
-                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                        
-                        val success = gatt.writeCharacteristic(characteristic)
-                        if (success) {
-                            // Suspend until onCharacteristicWrite fires (prevents 133 GATT_BUSY)
-                            writeCompleted.receive()
-                        } else {
-                            Log.e(TAG, "Failed to initiate writeCharacteristic")
-                        }
+        suspend fun writeChunk(chunk: ByteArray): Boolean {
+            writeMutex.lock()
+            try {
+                val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
+                if (characteristic != null) {
+                    characteristic.value = chunk
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    if (gatt.writeCharacteristic(characteristic)) {
+                        writeCompleted.receive() // Wait for onCharacteristicWrite
+                        return true
                     }
                 }
+                return false
+            } finally {
+                writeMutex.unlock()
             }
         }
     }
@@ -141,7 +138,6 @@ class BluetoothService(
                 Log.d(TAG, "Connected as client to: ${gatt.device.address}")
                 val conn = GattConnection(gatt)
                 activeGatts[gatt.device.address] = conn
-                macToPeerId[gatt.device.address]?.let { onPeerConnected?.invoke(it) }
                 // Request MTU to 512 immediately upon connection
                 gatt.requestMtu(512)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
@@ -162,6 +158,7 @@ class BluetoothService(
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "Services discovered for ${gatt.device.address}")
+                macToPeerId[gatt.device.address]?.let { onPeerConnected?.invoke(it) }
             }
         }
 
@@ -279,17 +276,16 @@ class BluetoothService(
         }
     }
 
-    private fun broadcast(payload: ByteArray) {
-        val packetId = payload.contentHashCode() // Unique ID for this broadcast
+    suspend fun broadcast(payload: ByteArray): Boolean {
+        val packetId = payload.contentHashCode()
         val chunkPayloads = payload.toList().chunked(MAX_CHUNK_PAYLOAD_SIZE).map { it.toByteArray() }
         val totalChunks = chunkPayloads.size
 
         if (totalChunks > 255) {
             Log.e(TAG, "Payload too large to fragment ($totalChunks chunks)")
-            return
+            return false
         }
 
-        // Prepend Header: [Packet ID (4 bytes) | Total Chunks (1 byte) | Chunk Index (1 byte)]
         val chunksToSend = chunkPayloads.mapIndexed { index, chunkData ->
             val buffer = ByteBuffer.allocate(6 + chunkData.size)
             buffer.putInt(packetId)
@@ -299,11 +295,22 @@ class BluetoothService(
             buffer.array()
         }
 
-        // Push chunks into the sequential FIFO queue of each active GATT client
-        activeGatts.values.forEach { connection ->
-            chunksToSend.forEach { chunk ->
-                connection.writeChannel.trySend(chunk)
+        if (activeGatts.isEmpty()) return false
+
+        val jobs = activeGatts.values.map { connection ->
+            serviceScope.async {
+                var connSuccess = true
+                for (chunk in chunksToSend) {
+                    if (!connection.writeChunk(chunk)) {
+                        connSuccess = false
+                        break
+                    }
+                }
+                connSuccess
             }
         }
+        
+        val results = jobs.awaitAll()
+        return results.any { it } // Return true if at least one connection successfully received all chunks
     }
 }
