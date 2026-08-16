@@ -1,4 +1,5 @@
 # ComLink
+Developed by **Aarush Chaudhary**.
 
 **ComLink** is a cypherpunk, off-grid, and serverless peer-to-peer chat application for Android. It operates completely independently of internet infrastructure, cellular networks, and Google Mobile Services (GMS). It relies entirely on a custom-built **Bluetooth Low Energy (BLE) GATT mesh network** to provide secure, multi-hop communication.
 
@@ -66,4 +67,4 @@ Built natively on top of **Google Tink**, ComLink guarantees end-to-end encrypti
 ---
 
 ## License
-MIT License
+GNU General Public License v3.0 (GPLv3)
