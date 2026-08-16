@@ -29,11 +29,18 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         router.onMessageReceived = { envelope ->
             processIncomingEnvelope(envelope)
         }
+    }
+
+    fun startBluetoothIfPermitted() {
         app.bluetoothService.startListening()
     }
 
     fun getMessages(peerId: String): Flow<List<MessageEntity>> {
         return dao.getMessagesForPeer(peerId)
+    }
+
+    fun getPeerFlow(peerId: String): Flow<PeerEntity?> {
+        return dao.getPeerFlow(peerId)
     }
 
     fun getMyQrPayload(): String {
@@ -72,7 +79,13 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    fun sendMessage(peerId: String, plaintext: String) {
+    fun sendMessage(
+        peerId: String, 
+        plaintext: String,
+        replyToId: String? = null,
+        replyToSender: String? = null,
+        replyToSnippet: String? = null
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             val peer = dao.getPeer(peerId) ?: return@launch
             val state = dao.getSessionState(peerId) ?: return@launch
@@ -108,7 +121,10 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 deviceId = peerId,
                 isFromMe = true,
                 plaintext = plaintext,
-                timestamp = envelope.timestamp ?: System.currentTimeMillis()
+                timestamp = envelope.timestamp ?: System.currentTimeMillis(),
+                replyToMessageId = replyToId,
+                replyToSenderId = replyToSender,
+                replyToTextSnippet = replyToSnippet
             )
             dao.insertMessage(msgEntity)
             

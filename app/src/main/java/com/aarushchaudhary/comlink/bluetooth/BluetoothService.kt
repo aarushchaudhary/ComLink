@@ -1,37 +1,175 @@
 package com.aarushchaudhary.comlink.bluetooth
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothServerSocket
-import android.bluetooth.BluetoothSocket
+import android.bluetooth.*
+import android.bluetooth.le.*
 import android.content.Context
+import android.os.Build
+import android.os.ParcelUuid
 import android.util.Log
-import java.io.IOException
-import java.io.InputStream
-import java.io.OutputStream
+import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import java.nio.ByteBuffer
 import java.util.UUID
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.ConcurrentHashMap
 
-@SuppressLint("MissingPermission") // Ensure permissions are checked by caller UI
+@SuppressLint("MissingPermission")
 class BluetoothService(
     private val context: Context,
     private val meshRouter: MeshRouter,
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
 ) {
-
     companion object {
         private const val TAG = "ComLinkBluetooth"
-        private const val APP_NAME = "ComLinkMesh"
-        // Standard SPP (Serial Port Profile) UUID for Bluetooth Classic
-        private val MY_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        // Same as BitChat
+        val SERVICE_UUID: UUID = UUID.fromString("F47B5E2D-4A9E-4C5A-9B3F-8E1D2C3A4B5C")
+        val CHARACTERISTIC_UUID: UUID = UUID.fromString("A1B2C3D4-E5F6-4A5B-8C9D-0E1F2A3B4C5D")
+
+        // MTU 512 - 3 (GATT overhead) - 6 (Custom Header) = 503
+        private const val MAX_CHUNK_PAYLOAD_SIZE = 500
     }
 
-    private var acceptThread: AcceptThread? = null
-    private val connectedThreads = CopyOnWriteArrayList<ConnectedThread>()
+    private val leAdvertiser by lazy { bluetoothAdapter?.bluetoothLeAdvertiser }
+    private val leScanner by lazy { bluetoothAdapter?.bluetoothLeScanner }
+    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+
+    private var gattServer: BluetoothGattServer? = null
+    private val activeGatts = ConcurrentHashMap<String, GattConnection>()
+
+    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // Buffers for reassembling fragmented messages on the Server
+    private class MessageBuffer(val totalChunks: Int) {
+        val chunks = arrayOfNulls<ByteArray>(totalChunks)
+        fun isComplete() = chunks.all { it != null }
+        fun reassemble(): ByteArray {
+            val totalSize = chunks.sumOf { it?.size ?: 0 }
+            val result = ByteBuffer.allocate(totalSize)
+            chunks.forEach { chunk ->
+                if (chunk != null) result.put(chunk)
+            }
+            return result.array()
+        }
+    }
+    
+    // Map of Packet ID to MessageBuffer
+    private val rxBuffers = ConcurrentHashMap<Int, MessageBuffer>()
+
+    // Concurrency protection: sequential FIFO queue for each GATT client
+    private inner class GattConnection(val gatt: BluetoothGatt) {
+        val writeChannel = Channel<ByteArray>(Channel.UNLIMITED)
+        val writeCompleted = Channel<Unit>(1)
+
+        init {
+            serviceScope.launch {
+                for (chunk in writeChannel) {
+                    val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
+                    if (characteristic != null) {
+                        characteristic.value = chunk
+                        // BitChat pattern: WRITE_TYPE_NO_RESPONSE for speed, but wait for callback
+                        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                        
+                        val success = gatt.writeCharacteristic(characteristic)
+                        if (success) {
+                            // Suspend until onCharacteristicWrite fires (prevents 133 GATT_BUSY)
+                            writeCompleted.receive()
+                        } else {
+                            Log.e(TAG, "Failed to initiate writeCharacteristic")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private val advertiseCallback = object : AdvertiseCallback() {
+        override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            Log.d(TAG, "BLE advertising started")
+        }
+        override fun onStartFailure(errorCode: Int) {
+            Log.e(TAG, "BLE advertising failed: $errorCode")
+        }
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            result?.device?.let { device ->
+                if (!activeGatts.containsKey(device.address)) {
+                    connectToDevice(device)
+                }
+            }
+        }
+    }
+
+    private val gattServerCallback = object : BluetoothGattServerCallback() {
+        override fun onConnectionStateChange(device: BluetoothDevice, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d(TAG, "Client connected to our server: ${device.address}")
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d(TAG, "Client disconnected from our server: ${device.address}")
+            }
+        }
+
+        override fun onCharacteristicWriteRequest(
+            device: BluetoothDevice,
+            requestId: Int,
+            characteristic: BluetoothGattCharacteristic,
+            preparedWrite: Boolean,
+            responseNeeded: Boolean,
+            offset: Int,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == CHARACTERISTIC_UUID) {
+                if (responseNeeded) {
+                    gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
+                }
+                handleIncomingChunk(value)
+            }
+        }
+    }
+
+    private val gattClientCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                Log.d(TAG, "Connected as client to: ${gatt.device.address}")
+                val conn = GattConnection(gatt)
+                activeGatts[gatt.device.address] = conn
+                // Request MTU to 512 immediately upon connection
+                gatt.requestMtu(512)
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                Log.d(TAG, "Disconnected from: ${gatt.device.address}")
+                activeGatts.remove(gatt.device.address)
+                gatt.close()
+            }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "MTU changed to $mtu for ${gatt.device.address}")
+                gatt.discoverServices()
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                Log.d(TAG, "Services discovered for ${gatt.device.address}")
+            }
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            if (characteristic.uuid == CHARACTERISTIC_UUID) {
+                // Unblock the queue for the next chunk
+                activeGatts[gatt.device.address]?.writeCompleted?.trySend(Unit)
+            }
+        }
+    }
 
     init {
-        // Wire up the MeshRouter broadcast callback to our sockets
+        // Wire up the MeshRouter broadcast callback to our BLE transmission
         meshRouter.broadcastToNetwork = { payload ->
             broadcast(payload)
         }
@@ -39,155 +177,122 @@ class BluetoothService(
 
     @Synchronized
     fun startListening() {
-        if (acceptThread != null) return
-        acceptThread = AcceptThread().apply { start() }
+        if (gattServer != null) return
+
+        try {
+            // 1. Setup GATT Server
+            gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
+            
+            val characteristic = BluetoothGattCharacteristic(
+                CHARACTERISTIC_UUID,
+                BluetoothGattCharacteristic.PROPERTY_WRITE or BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE,
+                BluetoothGattCharacteristic.PERMISSION_WRITE
+            )
+
+            val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
+            service.addCharacteristic(characteristic)
+            
+            gattServer?.addService(service)
+
+            // 2. Start Advertising (Dual-Role)
+            val settings = AdvertiseSettings.Builder()
+                .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+                .setConnectable(true)
+                .build()
+            val data = AdvertiseData.Builder()
+                .setIncludeDeviceName(false)
+                .addServiceUuid(ParcelUuid(SERVICE_UUID))
+                .build()
+            
+            leAdvertiser?.startAdvertising(settings, data, advertiseCallback)
+
+            // 3. Start Scanning (Dual-Role)
+            val filters = listOf(ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build())
+            val scanSettings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build()
+                
+            leScanner?.startScan(filters, scanSettings, scanCallback)
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Missing Bluetooth permissions: ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start BLE operations: ${e.message}")
+        }
     }
 
     @Synchronized
     fun stopAll() {
-        acceptThread?.cancel()
-        acceptThread = null
-        connectedThreads.forEach { it.cancel() }
-        connectedThreads.clear()
+        try {
+            leAdvertiser?.stopAdvertising(advertiseCallback)
+            leScanner?.stopScan(scanCallback)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to stop BLE advertising/scanning", e)
+        }
+        
+        activeGatts.values.forEach { it.gatt.close() }
+        activeGatts.clear()
+        
+        gattServer?.close()
+        gattServer = null
+        
+        serviceScope.cancel()
     }
 
     @Synchronized
     fun connectToDevice(device: BluetoothDevice) {
-        // Don't connect if we already have an active socket with this device
-        if (connectedThreads.any { it.socket.remoteDevice.address == device.address }) {
-            return
+        if (activeGatts.containsKey(device.address)) return
+        // Silent unbonded connection via BLE TRANSPORT_LE
+        device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun handleIncomingChunk(chunk: ByteArray) {
+        if (chunk.size < 6) return // Invalid header
+
+        val byteBuffer = ByteBuffer.wrap(chunk)
+        val packetId = byteBuffer.int
+        val totalChunks = byteBuffer.get().toInt() and 0xFF
+        val chunkIndex = byteBuffer.get().toInt() and 0xFF
+        val payloadData = ByteArray(chunk.size - 6)
+        byteBuffer.get(payloadData)
+
+        val buffer = rxBuffers.getOrPut(packetId) { MessageBuffer(totalChunks) }
+        
+        if (chunkIndex in 0 until totalChunks) {
+            buffer.chunks[chunkIndex] = payloadData
         }
-        ConnectThread(device).start()
+
+        if (buffer.isComplete()) {
+            val completePayload = buffer.reassemble()
+            rxBuffers.remove(packetId)
+            // Pass complete envelope back to router
+            meshRouter.onBytesReceived(completePayload)
+        }
     }
 
     private fun broadcast(payload: ByteArray) {
-        // Simple length-prefixed framing: 4 bytes for length, followed by payload
-        val lengthBytes = java.nio.ByteBuffer.allocate(4).putInt(payload.size).array()
-        val framedPayload = lengthBytes + payload
-        
-        connectedThreads.forEach { thread ->
-            thread.write(framedPayload)
-        }
-    }
+        val packetId = payload.contentHashCode() // Unique ID for this broadcast
+        val chunkPayloads = payload.toList().chunked(MAX_CHUNK_PAYLOAD_SIZE).map { it.toByteArray() }
+        val totalChunks = chunkPayloads.size
 
-    @Synchronized
-    private fun manageConnectedSocket(socket: BluetoothSocket) {
-        val connectedThread = ConnectedThread(socket)
-        connectedThreads.add(connectedThread)
-        connectedThread.start()
-    }
-
-    private inner class AcceptThread : Thread() {
-        private val serverSocket: BluetoothServerSocket? by lazy(LazyThreadSafetyMode.NONE) {
-            bluetoothAdapter?.listenUsingInsecureRfcommWithServiceRecord(APP_NAME, MY_UUID)
+        if (totalChunks > 255) {
+            Log.e(TAG, "Payload too large to fragment ($totalChunks chunks)")
+            return
         }
 
-        override fun run() {
-            var shouldLoop = true
-            while (shouldLoop) {
-                val socket: BluetoothSocket? = try {
-                    serverSocket?.accept()
-                } catch (e: IOException) {
-                    Log.e(TAG, "Socket's accept() method failed", e)
-                    shouldLoop = false
-                    null
-                }
-                socket?.also {
-                    manageConnectedSocket(it)
-                }
-            }
+        // Prepend Header: [Packet ID (4 bytes) | Total Chunks (1 byte) | Chunk Index (1 byte)]
+        val chunksToSend = chunkPayloads.mapIndexed { index, chunkData ->
+            val buffer = ByteBuffer.allocate(6 + chunkData.size)
+            buffer.putInt(packetId)
+            buffer.put(totalChunks.toByte())
+            buffer.put(index.toByte())
+            buffer.put(chunkData)
+            buffer.array()
         }
 
-        fun cancel() {
-            try {
-                serverSocket?.close()
-            } catch (e: IOException) {
-                Log.e(TAG, "Could not close the connect socket", e)
-            }
-        }
-    }
-
-    private inner class ConnectThread(device: BluetoothDevice) : Thread() {
-        private val socket: BluetoothSocket? by lazy(LazyThreadSafetyMode.NONE) {
-            device.createInsecureRfcommSocketToServiceRecord(MY_UUID)
-        }
-
-        override fun run() {
-            // Cancel discovery because it otherwise slows down the connection.
-            bluetoothAdapter?.cancelDiscovery()
-
-            socket?.let { socket ->
-                try {
-                    socket.connect()
-                    manageConnectedSocket(socket)
-                } catch (e: IOException) {
-                    Log.e(TAG, "Connection failed", e)
-                    try {
-                        socket.close()
-                    } catch (closeException: IOException) {
-                        Log.e(TAG, "Could not close the client socket", closeException)
-                    }
-                }
-            }
-        }
-    }
-
-    private inner class ConnectedThread(val socket: BluetoothSocket) : Thread() {
-        private val inStream: InputStream = socket.inputStream
-        private val outStream: OutputStream = socket.outputStream
-
-        override fun run() {
-            val lengthBuffer = ByteArray(4)
-            while (true) {
-                try {
-                    // Read framing length (4 bytes)
-                    var bytesRead = 0
-                    while (bytesRead < 4) {
-                        val count = inStream.read(lengthBuffer, bytesRead, 4 - bytesRead)
-                        if (count == -1) throw IOException("Stream closed")
-                        bytesRead += count
-                    }
-                    val payloadLength = java.nio.ByteBuffer.wrap(lengthBuffer).int
-                    
-                    if (payloadLength <= 0 || payloadLength > 10 * 1024 * 1024) { // Max 10MB sanity check
-                         throw IOException("Invalid payload length: $payloadLength")
-                    }
-
-                    // Read payload
-                    val payloadBuffer = ByteArray(payloadLength)
-                    bytesRead = 0
-                    while (bytesRead < payloadLength) {
-                        val count = inStream.read(payloadBuffer, bytesRead, payloadLength - bytesRead)
-                        if (count == -1) throw IOException("Stream closed")
-                        bytesRead += count
-                    }
-
-                    // Feed payload to the Mesh Router
-                    meshRouter.onBytesReceived(payloadBuffer)
-
-                } catch (e: IOException) {
-                    Log.d(TAG, "Input stream disconnected", e)
-                    connectedThreads.remove(this)
-                    break
-                }
-            }
-        }
-
-        fun write(bytes: ByteArray) {
-            try {
-                outStream.write(bytes)
-                outStream.flush()
-            } catch (e: IOException) {
-                Log.e(TAG, "Error occurred when sending data", e)
-                connectedThreads.remove(this)
-            }
-        }
-
-        fun cancel() {
-            try {
-                socket.close()
-            } catch (e: IOException) {
-                Log.e(TAG, "Could not close the connect socket", e)
+        // Push chunks into the sequential FIFO queue of each active GATT client
+        activeGatts.values.forEach { connection ->
+            chunksToSend.forEach { chunk ->
+                connection.writeChannel.trySend(chunk)
             }
         }
     }

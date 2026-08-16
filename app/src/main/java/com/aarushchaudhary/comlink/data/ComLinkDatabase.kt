@@ -7,8 +7,13 @@ import kotlinx.coroutines.flow.Flow
 data class PeerEntity(
     @PrimaryKey val deviceId: String,
     val publicKeyBase64: String,
-    val contactName: String
-)
+    val contactName: String,
+    val lastSeenTimestamp: Long = 0L,
+    @Ignore var isDirectlyConnected: Boolean = false
+) {
+    constructor(deviceId: String, publicKeyBase64: String, contactName: String, lastSeenTimestamp: Long) : 
+        this(deviceId, publicKeyBase64, contactName, lastSeenTimestamp, false)
+}
 
 @Entity(tableName = "session_states")
 data class SessionStateEntity(
@@ -34,7 +39,10 @@ data class MessageEntity(
     val deviceId: String,
     val isFromMe: Boolean,
     val plaintext: String,
-    val timestamp: Long
+    val timestamp: Long,
+    val replyToMessageId: String? = null,
+    val replyToSenderId: String? = null,
+    val replyToTextSnippet: String? = null
 )
 
 @Dao
@@ -45,6 +53,9 @@ interface ComLinkDao {
 
     @Query("SELECT * FROM peers")
     fun getAllPeers(): Flow<List<PeerEntity>>
+
+    @Query("SELECT * FROM peers WHERE deviceId = :deviceId LIMIT 1")
+    fun getPeerFlow(deviceId: String): Flow<PeerEntity?>
 
     @Query("SELECT * FROM peers WHERE deviceId = :deviceId LIMIT 1")
     suspend fun getPeer(deviceId: String): PeerEntity?
@@ -68,7 +79,7 @@ interface ComLinkDao {
     fun getMessagesForPeer(deviceId: String): Flow<List<MessageEntity>>
 }
 
-@Database(entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class], version = 1, exportSchema = false)
+@Database(entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class], version = 2, exportSchema = false)
 abstract class ComLinkDatabase : RoomDatabase() {
     abstract fun comLinkDao(): ComLinkDao
 }
