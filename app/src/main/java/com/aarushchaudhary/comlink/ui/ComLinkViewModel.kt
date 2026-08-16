@@ -58,7 +58,17 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             var currentCounter = state.myNextCounter
             
             for (msg in pending) {
-                val ciphertextBytes = cipher.encrypt(msg.plaintext.toByteArray(Charsets.UTF_8), currentCounter)
+                var finalPayload = msg.plaintext
+                if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
+                    val json = org.json.JSONObject()
+                    json.put("text", msg.plaintext)
+                    msg.replyToMessageId?.let { json.put("replyId", it) }
+                    msg.replyToSenderId?.let { json.put("replySender", it) }
+                    msg.replyToTextSnippet?.let { json.put("replySnippet", it) }
+                    finalPayload = json.toString()
+                }
+                
+                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), currentCounter)
                 val nonceBytes = cipher.constructNonce(currentCounter)
                 val envelope = Envelope(
                     sender_id = identity.getDeviceId(),
@@ -81,6 +91,12 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
 
     fun startBluetoothIfPermitted() {
         app.bluetoothService.startListening()
+    }
+
+    fun checkConnection(peerId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            app.bluetoothService.forceHeartbeat()
+        }
     }
 
     fun getMessages(peerId: String): Flow<List<MessageEntity>> {
@@ -147,7 +163,18 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             )
             
             val counter = state.myNextCounter
-            val ciphertextBytes = cipher.encrypt(plaintext.toByteArray(Charsets.UTF_8), counter)
+            
+            var finalPayload = plaintext
+            if (replyToId != null || replyToSender != null || replyToSnippet != null) {
+                val json = org.json.JSONObject()
+                json.put("text", plaintext)
+                replyToId?.let { json.put("replyId", it) }
+                replyToSender?.let { json.put("replySender", it) }
+                replyToSnippet?.let { json.put("replySnippet", it) }
+                finalPayload = json.toString()
+            }
+            
+            val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
             val nonceBytes = cipher.constructNonce(counter)
             
             val envId = UUID.randomUUID().toString()
@@ -211,19 +238,41 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 
                 dao.updatePeerCounter(senderId, counter)
                 
-                val plaintext = String(decryptedBytes, Charsets.UTF_8)
-                if (plaintext.startsWith("ACK:")) {
-                    val ackedId = plaintext.substringAfter("ACK:")
+                val plaintextRaw = String(decryptedBytes, Charsets.UTF_8)
+                if (plaintextRaw.startsWith("ACK:")) {
+                    val ackedId = plaintextRaw.substringAfter("ACK:")
                     dao.updateMessageStatus(ackedId, 2) // 2 = Delivered
                     return@launch
+                }
+                
+                var actualText = plaintextRaw
+                var repId: String? = null
+                var repSender: String? = null
+                var repSnippet: String? = null
+                
+                if (plaintextRaw.startsWith("{")) {
+                    try {
+                        val json = org.json.JSONObject(plaintextRaw)
+                        if (json.has("text")) {
+                            actualText = json.getString("text")
+                            repId = json.optString("replyId", "").takeIf { it.isNotEmpty() }
+                            repSender = json.optString("replySender", "").takeIf { it.isNotEmpty() }
+                            repSnippet = json.optString("replySnippet", "").takeIf { it.isNotEmpty() }
+                        }
+                    } catch (e: Exception) {
+                        // Not JSON, just use as text
+                    }
                 }
                 
                 val msgEntity = MessageEntity(
                     messageId = envelope.envelope_id ?: UUID.randomUUID().toString(),
                     deviceId = senderId,
                     isFromMe = false,
-                    plaintext = plaintext,
-                    timestamp = envelope.timestamp ?: System.currentTimeMillis()
+                    plaintext = actualText,
+                    timestamp = envelope.timestamp ?: System.currentTimeMillis(),
+                    replyToMessageId = repId,
+                    replyToSenderId = repSender,
+                    replyToTextSnippet = repSnippet
                 )
                 dao.insertMessage(msgEntity)
                 

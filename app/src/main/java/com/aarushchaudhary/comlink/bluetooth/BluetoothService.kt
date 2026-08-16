@@ -187,9 +187,18 @@ class BluetoothService(
         }
     }
 
+    private var heartbeatJob: Job? = null
+
     @Synchronized
     fun startListening() {
         if (gattServer != null) return
+
+        heartbeatJob = serviceScope.launch {
+            while (isActive) {
+                delay(5000)
+                forceHeartbeat()
+            }
+        }
 
         try {
             // 1. Setup GATT Server
@@ -235,6 +244,8 @@ class BluetoothService(
 
     @Synchronized
     fun stopAll() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
         try {
             leAdvertiser?.stopAdvertising(advertiseCallback)
             leScanner?.stopScan(scanCallback)
@@ -249,6 +260,24 @@ class BluetoothService(
         gattServer = null
         
         serviceScope.cancel()
+    }
+
+    fun forceHeartbeat() {
+        serviceScope.launch {
+            activeGatts.keys.toList().forEach { address ->
+                val conn = activeGatts[address] ?: return@forEach
+                val pingPayload = ("PING:" + meshRouter.localDeviceId).toByteArray()
+                val success = conn.writeChunk(pingPayload)
+                if (!success) {
+                    Log.d(TAG, "Heartbeat failed for $address")
+                    conn.gatt.disconnect()
+                    activeGatts.remove(address)
+                    macToPeerId[address]?.let { onPeerDisconnected?.invoke(it) }
+                } else {
+                    macToPeerId[address]?.let { onPeerConnected?.invoke(it) }
+                }
+            }
+        }
     }
 
     @Synchronized
@@ -281,6 +310,12 @@ class BluetoothService(
             val payloadStr = String(completePayload)
             if (payloadStr.startsWith("HELLO:")) {
                 val peerId = payloadStr.substringAfter("HELLO:")
+                macToPeerId[device.address] = peerId
+                onPeerConnected?.invoke(peerId)
+                return
+            }
+            if (payloadStr.startsWith("PING:")) {
+                val peerId = payloadStr.substringAfter("PING:")
                 macToPeerId[device.address] = peerId
                 onPeerConnected?.invoke(peerId)
                 return
