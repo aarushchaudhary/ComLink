@@ -127,7 +127,7 @@ class BluetoothService(
                 if (responseNeeded) {
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
                 }
-                handleIncomingChunk(value)
+                handleIncomingChunk(device, value)
             }
         }
     }
@@ -138,8 +138,8 @@ class BluetoothService(
                 Log.d(TAG, "Connected as client to: ${gatt.device.address}")
                 val conn = GattConnection(gatt)
                 activeGatts[gatt.device.address] = conn
-                // Request MTU to 512 immediately upon connection
-                gatt.requestMtu(512)
+                // Android BLE workaround: discover services first
+                gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Disconnected from: ${gatt.device.address}")
                 activeGatts.remove(gatt.device.address)
@@ -151,14 +151,20 @@ class BluetoothService(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "MTU changed to $mtu for ${gatt.device.address}")
-                gatt.discoverServices()
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "Services discovered for ${gatt.device.address}")
-                macToPeerId[gatt.device.address]?.let { onPeerConnected?.invoke(it) }
+                // Request MTU after services discovered
+                gatt.requestMtu(512)
+                
+                // Send HELLO packet to identify ourselves
+                serviceScope.launch {
+                    val helloPayload = ("HELLO:" + meshRouter.localDeviceId).toByteArray()
+                    broadcast(helloPayload) // Broadcast will reach this new connection
+                }
             }
         }
 
@@ -208,7 +214,7 @@ class BluetoothService(
             val data = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
-                .addServiceData(ParcelUuid(SERVICE_UUID), meshRouter.localDeviceId.toByteArray())
+                
                 .build()
             
             leAdvertiser?.startAdvertising(settings, data, advertiseCallback)
@@ -252,7 +258,7 @@ class BluetoothService(
         device.connectGatt(context, false, gattClientCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
-    private fun handleIncomingChunk(chunk: ByteArray) {
+    private fun handleIncomingChunk(device: BluetoothDevice, chunk: ByteArray) {
         if (chunk.size < 6) return // Invalid header
 
         val byteBuffer = ByteBuffer.wrap(chunk)
@@ -271,6 +277,15 @@ class BluetoothService(
         if (buffer.isComplete()) {
             val completePayload = buffer.reassemble()
             rxBuffers.remove(packetId)
+            
+            val payloadStr = String(completePayload)
+            if (payloadStr.startsWith("HELLO:")) {
+                val peerId = payloadStr.substringAfter("HELLO:")
+                macToPeerId[device.address] = peerId
+                onPeerConnected?.invoke(peerId)
+                return
+            }
+            
             // Pass complete envelope back to router
             meshRouter.onBytesReceived(completePayload)
         }
