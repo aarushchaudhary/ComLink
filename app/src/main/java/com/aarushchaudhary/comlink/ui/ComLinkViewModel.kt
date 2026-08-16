@@ -16,6 +16,8 @@ import kotlinx.coroutines.launch
 import okio.ByteString.Companion.toByteString
 import java.util.UUID
 
+import kotlinx.coroutines.isActive
+
 class ComLinkViewModel(application: Application) : AndroidViewModel(application) {
 
     private val app = application as ComLinkApp
@@ -33,6 +35,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         app.bluetoothService.onPeerConnected = { peerId ->
             viewModelScope.launch(Dispatchers.IO) {
                 dao.updatePeerConnectedStatus(peerId, true)
+                dao.updatePeerLastSeen(peerId, System.currentTimeMillis())
                 resendPendingMessages(peerId)
             }
         }
@@ -41,6 +44,20 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             viewModelScope.launch(Dispatchers.IO) {
                 dao.updatePeerConnectedStatus(peerId, false)
                 dao.updatePeerLastSeen(peerId, System.currentTimeMillis())
+            }
+        }
+        
+        // Presence Monitor
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                kotlinx.coroutines.delay(5000)
+                val allPeers = dao.getAllPeersSync()
+                val now = System.currentTimeMillis()
+                for (peer in allPeers) {
+                    if (peer.isDirectlyConnected && (now - peer.lastSeenTimestamp) > 15000) {
+                        dao.updatePeerConnectedStatus(peer.deviceId, false)
+                    }
+                }
             }
         }
     }

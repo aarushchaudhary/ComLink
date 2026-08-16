@@ -55,6 +55,9 @@ interface ComLinkDao {
     @Query("SELECT * FROM peers")
     fun getAllPeers(): Flow<List<PeerEntity>>
 
+    @Query("SELECT * FROM peers")
+    suspend fun getAllPeersSync(): List<PeerEntity>
+
     @Query("SELECT * FROM peers WHERE deviceId = :deviceId LIMIT 1")
     fun getPeerFlow(deviceId: String): Flow<PeerEntity?>
 

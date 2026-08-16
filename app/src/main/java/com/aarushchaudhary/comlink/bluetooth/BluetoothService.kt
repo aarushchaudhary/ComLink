@@ -70,11 +70,19 @@ class BluetoothService(
                 if (characteristic != null) {
                     characteristic.value = chunk
                     characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    
+                    // Drain old events
+                    while(writeCompleted.tryReceive().isSuccess) {}
+                    
                     if (gatt.writeCharacteristic(characteristic)) {
-                        writeCompleted.receive() // Wait for onCharacteristicWrite
-                        return true
+                        val result = kotlinx.coroutines.withTimeoutOrNull(2000L) {
+                            writeCompleted.receive()
+                        }
+                        return result != null
                     }
                 }
+                return false
+            } catch (e: Exception) {
                 return false
             } finally {
                 writeMutex.unlock()
