@@ -29,6 +29,51 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         router.onMessageReceived = { envelope ->
             processIncomingEnvelope(envelope)
         }
+        
+        app.bluetoothService.onPeerConnected = { peerId ->
+            viewModelScope.launch(Dispatchers.IO) {
+                dao.updatePeerConnectedStatus(peerId, true)
+                resendPendingMessages(peerId)
+            }
+        }
+        
+        app.bluetoothService.onPeerDisconnected = { peerId ->
+            viewModelScope.launch(Dispatchers.IO) {
+                dao.updatePeerConnectedStatus(peerId, false)
+                dao.updatePeerLastSeen(peerId, System.currentTimeMillis())
+            }
+        }
+    }
+    
+    private fun resendPendingMessages(peerId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val pending = dao.getPendingMessages(peerId)
+            if (pending.isEmpty()) return@launch
+            
+            val peer = dao.getPeer(peerId) ?: return@launch
+            val state = dao.getSessionState(peerId) ?: return@launch
+            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
+            val cipher = SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+            
+            var currentCounter = state.myNextCounter
+            
+            for (msg in pending) {
+                val ciphertextBytes = cipher.encrypt(msg.plaintext.toByteArray(Charsets.UTF_8), currentCounter)
+                val nonceBytes = cipher.constructNonce(currentCounter)
+                val envelope = Envelope(
+                    sender_id = identity.getDeviceId(),
+                    recipient_id = peerId,
+                    ciphertext = ciphertextBytes.toByteString(),
+                    nonce = nonceBytes.toByteString(),
+                    timestamp = msg.timestamp,
+                    envelope_id = msg.messageId,
+                    ttl = 10
+                )
+                currentCounter++
+                router.sendLocalMessage(envelope)
+            }
+            dao.updateMyCounter(peerId, currentCounter)
+        }
     }
 
     fun startBluetoothIfPermitted() {
@@ -161,6 +206,12 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 dao.updatePeerCounter(senderId, counter)
                 
                 val plaintext = String(decryptedBytes, Charsets.UTF_8)
+                if (plaintext.startsWith("ACK:")) {
+                    val ackedId = plaintext.substringAfter("ACK:")
+                    dao.updateMessageStatus(ackedId, 1) // 1 = Delivered
+                    return@launch
+                }
+                
                 val msgEntity = MessageEntity(
                     messageId = envelope.envelope_id ?: UUID.randomUUID().toString(),
                     deviceId = senderId,
@@ -170,9 +221,38 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 )
                 dao.insertMessage(msgEntity)
                 
+                // Send ACK
+                sendAck(senderId, msgEntity.messageId)
+                
             } catch (e: Exception) {
                 e.printStackTrace() // Decryption failed
             }
+        }
+    }
+    
+    private fun sendAck(peerId: String, messageId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val peer = dao.getPeer(peerId) ?: return@launch
+            val state = dao.getSessionState(peerId) ?: return@launch
+            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
+            val cipher = SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+            
+            val counter = state.myNextCounter
+            val ciphertextBytes = cipher.encrypt("ACK:$messageId".toByteArray(Charsets.UTF_8), counter)
+            val nonceBytes = cipher.constructNonce(counter)
+            
+            val envelope = Envelope(
+                sender_id = identity.getDeviceId(),
+                recipient_id = peerId,
+                ciphertext = ciphertextBytes.toByteString(),
+                nonce = nonceBytes.toByteString(),
+                timestamp = System.currentTimeMillis(),
+                envelope_id = UUID.randomUUID().toString(),
+                ttl = 10
+            )
+            
+            dao.updateMyCounter(peerId, counter + 1)
+            router.sendLocalMessage(envelope)
         }
     }
 }

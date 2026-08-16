@@ -81,7 +81,7 @@ fun ConversationScreen(
                             Column(modifier = Modifier.padding(10.dp)) {
                                 if (msg.replyToTextSnippet != null) {
                                     Surface(
-                                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.4f),
+                                        color = if (msg.isFromMe) MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.8f) else MaterialTheme.colorScheme.surface,
                                         shape = RoundedCornerShape(8.dp),
                                         modifier = Modifier.padding(bottom = 4.dp).fillMaxWidth(0.8f)
                                     ) {
@@ -94,8 +94,9 @@ fun ConversationScreen(
                                 
                                 Text(msg.plaintext, fontSize = 16.sp)
                                 
+                                val tickStr = if (msg.isFromMe) { if (msg.status == 1) " ✓✓" else " ✓" } else ""
                                 Text(
-                                    text = formatTimestamp(msg.timestamp), 
+                                    text = formatTimestamp(msg.timestamp) + tickStr, 
                                     fontSize = 10.sp, 
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     modifier = Modifier.align(Alignment.End).padding(top = 4.dp)

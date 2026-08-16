@@ -28,7 +28,7 @@ class ComLinkApp : Application() {
             this,
             ComLinkDatabase::class.java,
             "comlink_db"
-        ).fallbackToDestructiveMigration().build()
+        ).build()
         
         identityManager = IdentityManager(this)
         

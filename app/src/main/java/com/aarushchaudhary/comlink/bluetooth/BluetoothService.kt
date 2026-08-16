@@ -19,6 +19,9 @@ class BluetoothService(
     private val meshRouter: MeshRouter,
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
 ) {
+    var onPeerConnected: ((String) -> Unit)? = null
+    var onPeerDisconnected: ((String) -> Unit)? = null
+    private val macToPeerId = ConcurrentHashMap<String, String>()
     companion object {
         private const val TAG = "ComLinkBluetooth"
         // Same as BitChat
@@ -94,6 +97,10 @@ class BluetoothService(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             result?.device?.let { device ->
+                val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
+                if (serviceData != null) {
+                    macToPeerId[device.address] = String(serviceData)
+                }
                 if (!activeGatts.containsKey(device.address)) {
                     connectToDevice(device)
                 }
@@ -134,11 +141,13 @@ class BluetoothService(
                 Log.d(TAG, "Connected as client to: ${gatt.device.address}")
                 val conn = GattConnection(gatt)
                 activeGatts[gatt.device.address] = conn
+                macToPeerId[gatt.device.address]?.let { onPeerConnected?.invoke(it) }
                 // Request MTU to 512 immediately upon connection
                 gatt.requestMtu(512)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Disconnected from: ${gatt.device.address}")
                 activeGatts.remove(gatt.device.address)
+                macToPeerId[gatt.device.address]?.let { onPeerDisconnected?.invoke(it) }
                 gatt.close()
             }
         }
@@ -202,6 +211,7 @@ class BluetoothService(
             val data = AdvertiseData.Builder()
                 .setIncludeDeviceName(false)
                 .addServiceUuid(ParcelUuid(SERVICE_UUID))
+                .addServiceData(ParcelUuid(SERVICE_UUID), meshRouter.localDeviceId.toByteArray())
                 .build()
             
             leAdvertiser?.startAdvertising(settings, data, advertiseCallback)

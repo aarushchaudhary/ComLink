@@ -5,7 +5,7 @@ import com.aarushchaudhary.comlink.proto.Envelope
 import java.util.Collections
 import java.util.LinkedHashMap
 
-class MeshRouter(private val localDeviceId: String) {
+class MeshRouter(val localDeviceId: String) {
 
     // Listener for messages that are destined for this device
     var onMessageReceived: ((Envelope) -> Unit)? = null

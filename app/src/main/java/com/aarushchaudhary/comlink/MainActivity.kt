@@ -148,11 +148,15 @@ fun ComLinkAppUi(viewModel: ComLinkViewModel) {
             onBack = { currentScreen = Screen.PeerList },
             onContactSaved = { currentScreen = Screen.PeerList }
         )
-        is Screen.Settings -> SettingsScreen(
-            context = context,
-            onBack = { currentScreen = Screen.PeerList }
-        )
+        is Screen.Settings -> {
+            BackHandler(onBack = { currentScreen = Screen.PeerList })
+            SettingsScreen(
+                context = context,
+                onBack = { currentScreen = Screen.PeerList }
+            )
+        }
         is Screen.Chat -> {
+            BackHandler(onBack = { currentScreen = Screen.PeerList })
             val peer by viewModel.getPeerFlow(screen.deviceId).collectAsState(initial = null)
             ConversationScreen(
                 viewModel = viewModel,

@@ -9,7 +9,7 @@ data class PeerEntity(
     val publicKeyBase64: String,
     val contactName: String,
     val lastSeenTimestamp: Long = 0L,
-    @Ignore var isDirectlyConnected: Boolean = false
+    @ColumnInfo(defaultValue = "false") var isDirectlyConnected: Boolean = false
 ) {
     constructor(deviceId: String, publicKeyBase64: String, contactName: String, lastSeenTimestamp: Long) : 
         this(deviceId, publicKeyBase64, contactName, lastSeenTimestamp, false)
@@ -42,7 +42,8 @@ data class MessageEntity(
     val timestamp: Long,
     val replyToMessageId: String? = null,
     val replyToSenderId: String? = null,
-    val replyToTextSnippet: String? = null
+    val replyToTextSnippet: String? = null,
+    @ColumnInfo(defaultValue = "0") val status: Int = 0
 )
 
 @Dao
@@ -75,11 +76,28 @@ interface ComLinkDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessage(message: MessageEntity)
 
-    @Query("SELECT * FROM messages WHERE deviceId = :deviceId ORDER BY timestamp ASC")
+    @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND plaintext NOT LIKE 'ACK:%' ORDER BY timestamp ASC")
     fun getMessagesForPeer(deviceId: String): Flow<List<MessageEntity>>
+
+    @Query("UPDATE peers SET isDirectlyConnected = :isConnected WHERE deviceId = :deviceId")
+    suspend fun updatePeerConnectedStatus(deviceId: String, isConnected: Boolean)
+
+    @Query("UPDATE peers SET lastSeenTimestamp = :timestamp WHERE deviceId = :deviceId")
+    suspend fun updatePeerLastSeen(deviceId: String, timestamp: Long)
+
+    @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND status = 0 AND isFromMe = 1 ORDER BY timestamp ASC")
+    suspend fun getPendingMessages(deviceId: String): List<MessageEntity>
+
+    @Query("UPDATE messages SET status = :status WHERE messageId = :messageId")
+    suspend fun updateMessageStatus(messageId: String, status: Int)
 }
 
-@Database(entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class], version = 2, exportSchema = false)
+@Database(
+    entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class], 
+    version = 3, 
+    exportSchema = true,
+    autoMigrations = [AutoMigration(from = 2, to = 3)]
+)
 abstract class ComLinkDatabase : RoomDatabase() {
     abstract fun comLinkDao(): ComLinkDao
 }
