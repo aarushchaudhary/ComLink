@@ -22,6 +22,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import com.aarushchaudhary.comlink.ui.theme.dataStore
+import kotlinx.coroutines.flow.map
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowBack
@@ -388,7 +390,8 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
                 Text("YOUR QR IDENTITY", color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(32.dp))
                 
-                val qrBitmap = remember { QrUtils.generateQrBitmap(viewModel.getMyQrPayload()) }
+                val myName by context.dataStore.data.map { it[com.aarushchaudhary.comlink.ui.theme.myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
+                val qrBitmap = remember(myName) { QrUtils.generateQrBitmap(viewModel.getMyQrPayload(myName)) }
                 Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = "QR Code", modifier = Modifier.size(250.dp).border(2.dp, accentColor))
                 
                 Spacer(modifier = Modifier.height(32.dp))

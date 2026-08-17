@@ -124,13 +124,13 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         return dao.getPeerFlow(peerId)
     }
 
-    fun getMyQrPayload(): String {
+    fun getMyQrPayload(displayName: String): String {
         val pubKey = Base64.encodeToString(identity.getPublicKey(), Base64.NO_WRAP)
         val devId = identity.getDeviceId()
         val payload = com.aarushchaudhary.comlink.proto.ContactPayload(
             device_id = devId,
             public_key = pubKey,
-            display_name = "Cypherpunk User" // Placeholder, should be read from DataStore
+            display_name = displayName
         )
         return Base64.encodeToString(com.aarushchaudhary.comlink.proto.ContactPayload.ADAPTER.encode(payload), Base64.NO_WRAP)
     }

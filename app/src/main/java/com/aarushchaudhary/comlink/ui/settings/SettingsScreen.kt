@@ -23,10 +23,17 @@ import com.aarushchaudhary.comlink.ui.theme.customAccentColorPref
 import com.aarushchaudhary.comlink.ui.theme.dataStore
 import kotlinx.coroutines.launch
 
+import com.aarushchaudhary.comlink.ui.theme.myDisplayNamePref
+import kotlinx.coroutines.flow.map
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+
 @Composable
 fun SettingsScreen(context: Context, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val accentColor = MaterialTheme.colorScheme.primary
+    
+    val myName by context.dataStore.data.map { it[myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
 
     Column(
         modifier = Modifier.fillMaxSize().background(Color.Black).padding(16.dp),
@@ -38,6 +45,30 @@ fun SettingsScreen(context: Context, onBack: () -> Unit) {
         ) {
             Text("> SYSTEM OPTIONS <", color = accentColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
         }
+        
+        Spacer(Modifier.height(32.dp))
+        
+        Text("MY DISPLAY NAME", color = Color.White, fontFamily = FontFamily.Monospace)
+        Spacer(Modifier.height(8.dp))
+        
+        OutlinedTextField(
+            value = myName,
+            onValueChange = { newName ->
+                scope.launch {
+                    context.dataStore.edit { it[myDisplayNamePref] = newName }
+                }
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedTextColor = Color.White,
+                unfocusedTextColor = Color.White,
+                cursorColor = accentColor,
+                focusedBorderColor = accentColor,
+                unfocusedBorderColor = Color.DarkGray
+            ),
+            singleLine = true,
+            textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace)
+        )
         
         Spacer(Modifier.height(32.dp))
         
