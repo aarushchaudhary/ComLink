@@ -60,7 +60,7 @@ wire {
 dependencies {
     val composeBomVersion = "2024.06.00"
     val roomVersion = "2.6.1"
-    val cameraxVersion = "1.3.4"
+    val cameraxVersion = "1.4.0"
     val tinkVersion = "1.9.0"
 
     // Core

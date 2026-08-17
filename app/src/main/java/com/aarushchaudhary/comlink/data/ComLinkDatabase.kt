@@ -9,10 +9,12 @@ data class PeerEntity(
     val publicKeyBase64: String,
     val contactName: String,
     val lastSeenTimestamp: Long = 0L,
-    @ColumnInfo(defaultValue = "false") var isDirectlyConnected: Boolean = false
+    @ColumnInfo(defaultValue = "false") var isDirectlyConnected: Boolean = false,
+    @ColumnInfo(defaultValue = "") val exchangedName: String = "",
+    val nickname: String? = null
 ) {
     constructor(deviceId: String, publicKeyBase64: String, contactName: String, lastSeenTimestamp: Long) : 
-        this(deviceId, publicKeyBase64, contactName, lastSeenTimestamp, false)
+        this(deviceId, publicKeyBase64, contactName, lastSeenTimestamp, false, "", null)
 }
 
 @Entity(tableName = "session_states")
@@ -97,9 +99,12 @@ interface ComLinkDao {
 
 @Database(
     entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class], 
-    version = 3, 
+    version = 4, 
     exportSchema = true,
-    autoMigrations = [AutoMigration(from = 2, to = 3)]
+    autoMigrations = [
+        AutoMigration(from = 2, to = 3),
+        AutoMigration(from = 3, to = 4)
+    ]
 )
 abstract class ComLinkDatabase : RoomDatabase() {
     abstract fun comLinkDao(): ComLinkDao

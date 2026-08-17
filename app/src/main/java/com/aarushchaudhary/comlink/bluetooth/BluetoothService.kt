@@ -34,7 +34,7 @@ class BluetoothService(
 
     private val leAdvertiser by lazy { bluetoothAdapter?.bluetoothLeAdvertiser }
     private val leScanner by lazy { bluetoothAdapter?.bluetoothLeScanner }
-    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
 
     private var gattServer: BluetoothGattServer? = null
     private val activeGatts = ConcurrentHashMap<String, GattConnection>()
@@ -199,7 +199,7 @@ class BluetoothService(
 
     @Synchronized
     fun startListening() {
-        if (gattServer != null) return
+        if (gattServer != null || bluetoothManager == null || bluetoothAdapter == null) return
 
         heartbeatJob = serviceScope.launch {
             while (isActive) {

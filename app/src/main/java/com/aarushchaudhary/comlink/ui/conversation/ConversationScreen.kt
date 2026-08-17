@@ -1,22 +1,25 @@
 package com.aarushchaudhary.comlink.ui.conversation
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -25,7 +28,7 @@ import com.aarushchaudhary.comlink.ui.ComLinkViewModel
 import java.text.SimpleDateFormat
 import java.util.*
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun ConversationScreen(
     viewModel: ComLinkViewModel,
@@ -41,115 +44,119 @@ fun ConversationScreen(
     
     val clipboardManager = LocalClipboardManager.current
     var showContextMenuFor by remember { mutableStateOf<MessageEntity?>(null) }
+    val accentColor = MaterialTheme.colorScheme.primary
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { 
-                    Column {
-                        Text(contactName, fontWeight = FontWeight.Bold)
-                        Text(
-                            text = if (isOnline) "Online" else if (lastSeen > 0L) "Last seen ${formatTimestamp(lastSeen)}" else "Offline",
-                            fontSize = 12.sp,
-                            color = if (isOnline) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
-                },
-                actions = {
-                    IconButton(onClick = { viewModel.checkConnection(peerId) }) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Check Connection")
-                    }
-                }
-            )
+    Column(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // Cypherpunk Top Bar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .border(1.dp, accentColor)
+                .padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = accentColor) }
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
+                Text(contactName, color = Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                val statusText = if (isOnline) "[ONLINE]" else if (lastSeen > 0L) "[OFFLINE] ${formatTimestamp(lastSeen)}" else "[OFFLINE]"
+                Text(statusText, color = if (isOnline) accentColor else Color.Gray, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            }
+            IconButton(onClick = { viewModel.checkConnection(peerId) }) {
+                Icon(Icons.Default.Refresh, contentDescription = "Check Connection", tint = accentColor)
+            }
         }
-    ) { padding ->
-        Column(modifier = Modifier.padding(padding).fillMaxSize()) {
-            LazyColumn(modifier = Modifier.weight(1f), reverseLayout = true) {
-                items(messages.reversed()) { msg ->
-                    val alignment = if (msg.isFromMe) Alignment.End else Alignment.Start
-                    val color = if (msg.isFromMe) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
-                    
-                    Column(
-                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
-                        horizontalAlignment = alignment
-                    ) {
-                        Surface(
-                            shape = RoundedCornerShape(16.dp),
-                            color = color,
-                            modifier = Modifier.combinedClickable(
+        
+        LazyColumn(modifier = Modifier.weight(1f), reverseLayout = true) {
+            items(messages.reversed()) { msg ->
+                val alignment = if (msg.isFromMe) Alignment.End else Alignment.Start
+                val borderColor = if (msg.isFromMe) accentColor else Color.DarkGray
+                
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+                    horizontalAlignment = alignment
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .border(1.dp, borderColor)
+                            .background(Color.Black)
+                            .combinedClickable(
                                 onClick = {},
                                 onLongClick = { showContextMenuFor = msg }
                             )
-                        ) {
-                            Column(modifier = Modifier.padding(10.dp)) {
-                                if (msg.replyToTextSnippet != null) {
-                                    Surface(
-                                        color = if (msg.isFromMe) MaterialTheme.colorScheme.surfaceVariant.copy(alpha=0.8f) else MaterialTheme.colorScheme.surface,
-                                        shape = RoundedCornerShape(8.dp),
-                                        modifier = Modifier.padding(bottom = 4.dp).fillMaxWidth(0.8f)
-                                    ) {
-                                        Column(modifier = Modifier.padding(8.dp)) {
-                                            Text(msg.replyToSenderId ?: "Unknown", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
-                                            Text(msg.replyToTextSnippet, fontSize = 12.sp, maxLines = 1)
-                                        }
+                            .padding(10.dp)
+                    ) {
+                        Column {
+                            if (msg.replyToTextSnippet != null) {
+                                Box(
+                                    modifier = Modifier
+                                        .padding(bottom = 8.dp)
+                                        .border(1.dp, Color.Gray)
+                                        .padding(8.dp)
+                                ) {
+                                    Column {
+                                        Text("> ${msg.replyToSenderId ?: "UNKNOWN"}", fontSize = 11.sp, color = accentColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                                        Text(msg.replyToTextSnippet, fontSize = 12.sp, color = Color.LightGray, fontFamily = FontFamily.Monospace, maxLines = 1)
                                     }
                                 }
-                                
-                                Text(msg.plaintext, fontSize = 16.sp)
-                                
-                                val tickStr = if (msg.isFromMe) {
-                                    when (msg.status) {
-                                        0 -> " 🕒"
-                                        1 -> " ✓"
-                                        2 -> " ✓✓"
-                                        else -> ""
-                                    }
-                                } else ""
-                                Text(
-                                    text = formatTimestamp(msg.timestamp) + tickStr, 
-                                    fontSize = 10.sp, 
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.align(Alignment.End).padding(top = 4.dp)
-                                )
                             }
+                            
+                            Text(msg.plaintext, fontSize = 16.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                            
+                            val tickStr = if (msg.isFromMe) {
+                                when (msg.status) {
+                                    0 -> " [WAIT]"
+                                    1 -> " [SENT]"
+                                    2 -> " [ACK]"
+                                    else -> ""
+                                }
+                            } else ""
+                            Text(
+                                text = formatTimestamp(msg.timestamp) + tickStr, 
+                                fontSize = 10.sp, 
+                                color = Color.Gray,
+                                fontFamily = FontFamily.Monospace,
+                                modifier = Modifier.align(Alignment.End).padding(top = 4.dp)
+                            )
                         }
                     }
                 }
             }
-            
-            if (replyingTo != null) {
-                Surface(
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp), 
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text("Replying to ${if (replyingTo!!.isFromMe) "You" else contactName}", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                            Text(replyingTo!!.plaintext, maxLines = 1, fontSize = 12.sp)
-                        }
-                        IconButton(onClick = { replyingTo = null }) {
-                            Icon(Icons.Default.Close, "Cancel Reply")
-                        }
+        }
+        
+        if (replyingTo != null) {
+            Box(modifier = Modifier.fillMaxWidth().border(1.dp, accentColor).background(Color.Black).padding(8.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("REPLYING TO: ${if (replyingTo!!.isFromMe) "YOU" else contactName}", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = accentColor, fontFamily = FontFamily.Monospace)
+                        Text(replyingTo!!.plaintext, maxLines = 1, fontSize = 12.sp, color = Color.White, fontFamily = FontFamily.Monospace)
+                    }
+                    IconButton(onClick = { replyingTo = null }) {
+                        Icon(Icons.Default.Close, "Cancel Reply", tint = Color.Red)
                     }
                 }
             }
-            
-            Row(modifier = Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(
-                    value = inputText,
-                    onValueChange = { inputText = it },
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("Message") },
-                    shape = RoundedCornerShape(24.dp)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Button(onClick = {
+        }
+        
+        Row(
+            modifier = Modifier.fillMaxWidth().border(1.dp, accentColor).padding(4.dp), 
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedTextField(
+                value = inputText,
+                onValueChange = { inputText = it },
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("INPUT COMMAND...", color = Color.Gray, fontFamily = FontFamily.Monospace) },
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedTextColor = Color.White,
+                    unfocusedTextColor = Color.White,
+                    cursorColor = accentColor,
+                    focusedBorderColor = Color.Transparent,
+                    unfocusedBorderColor = Color.Transparent
+                ),
+                textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace)
+            )
+            Button(
+                onClick = {
                     if (inputText.isNotBlank()) {
                         viewModel.sendMessage(
                             peerId = peerId, 
@@ -161,36 +168,39 @@ fun ConversationScreen(
                         inputText = ""
                         replyingTo = null
                     }
-                }) {
-                    Text("Send")
-                }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent)
+            ) {
+                Text("[SEND]", color = accentColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
             }
         }
-        
-        if (showContextMenuFor != null) {
-            ModalBottomSheet(onDismissRequest = { showContextMenuFor = null }) {
-                Column(Modifier.padding(bottom = 32.dp)) {
-                    ListItem(
-                        headlineContent = { Text("Reply") },
-                        modifier = Modifier.clickable {
-                            replyingTo = showContextMenuFor
-                            showContextMenuFor = null
-                        }
-                    )
-                    ListItem(
-                        headlineContent = { Text("Copy Text") },
-                        modifier = Modifier.clickable {
-                            clipboardManager.setText(AnnotatedString(showContextMenuFor!!.plaintext))
-                            showContextMenuFor = null
-                        }
-                    )
-                }
+    }
+    
+    if (showContextMenuFor != null) {
+        ModalBottomSheet(onDismissRequest = { showContextMenuFor = null }, containerColor = Color.Black) {
+            Column(Modifier.padding(bottom = 32.dp)) {
+                ListItem(
+                    headlineContent = { Text("> REPLY", color = accentColor, fontFamily = FontFamily.Monospace) },
+                    modifier = Modifier.clickable {
+                        replyingTo = showContextMenuFor
+                        showContextMenuFor = null
+                    },
+                    colors = ListItemDefaults.colors(containerColor = Color.Black)
+                )
+                ListItem(
+                    headlineContent = { Text("> COPY TEXT", color = accentColor, fontFamily = FontFamily.Monospace) },
+                    modifier = Modifier.clickable {
+                        clipboardManager.setText(AnnotatedString(showContextMenuFor!!.plaintext))
+                        showContextMenuFor = null
+                    },
+                    colors = ListItemDefaults.colors(containerColor = Color.Black)
+                )
             }
         }
     }
 }
 
 private fun formatTimestamp(time: Long): String {
-    val sdf = SimpleDateFormat("h:mm a", Locale.getDefault())
+    val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
     return sdf.format(Date(time))
 }

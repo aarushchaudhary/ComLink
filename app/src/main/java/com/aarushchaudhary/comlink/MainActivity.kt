@@ -15,6 +15,8 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -125,92 +127,85 @@ fun PermissionGate(onPermissionsGranted: @Composable () -> Unit) {
 }
 
 sealed class Screen {
-    object PeerList : Screen()
-    object AddContact : Screen()
-    object Settings : Screen()
+    data class MainTabs(val tabIndex: Int = 0) : Screen()
     data class Chat(val deviceId: String, val contactName: String) : Screen()
 }
 
 @Composable
 fun ComLinkAppUi(viewModel: ComLinkViewModel) {
-    var currentScreen by remember { mutableStateOf<Screen>(Screen.PeerList) }
+    var currentScreen by remember { mutableStateOf<Screen>(Screen.MainTabs(0)) }
     val context = LocalContext.current
 
     when (val screen = currentScreen) {
-        is Screen.PeerList -> PeerListScreen(
-            viewModel = viewModel,
-            onNavigateToAddContact = { currentScreen = Screen.AddContact },
-            onNavigateToChat = { devId, name -> currentScreen = Screen.Chat(devId, name) },
-            onNavigateToSettings = { currentScreen = Screen.Settings }
-        )
-        is Screen.AddContact -> AddContactScreen(
-            viewModel = viewModel,
-            onBack = { currentScreen = Screen.PeerList },
-            onContactSaved = { currentScreen = Screen.PeerList }
-        )
-        is Screen.Settings -> {
-            BackHandler(onBack = { currentScreen = Screen.PeerList })
-            SettingsScreen(
-                context = context,
-                onBack = { currentScreen = Screen.PeerList }
-            )
+        is Screen.MainTabs -> {
+            Column(modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+                Box(modifier = Modifier.weight(1f)) {
+                    when (screen.tabIndex) {
+                        0 -> ChatsTab(
+                            viewModel = viewModel,
+                            onNavigateToChat = { devId, name -> currentScreen = Screen.Chat(devId, name) }
+                        )
+                        1 -> ContactsTab(viewModel = viewModel)
+                        2 -> SettingsScreen(
+                            context = context,
+                            onBack = { currentScreen = Screen.MainTabs(0) }
+                        )
+                    }
+                }
+                com.aarushchaudhary.comlink.ui.CypherpunkBottomBar(
+                    currentTab = screen.tabIndex,
+                    onTabSelected = { currentScreen = Screen.MainTabs(it) },
+                    accentColor = androidx.compose.ui.graphics.Color.Green
+                )
+            }
         }
         is Screen.Chat -> {
-            BackHandler(onBack = { currentScreen = Screen.PeerList })
+            BackHandler(onBack = { currentScreen = Screen.MainTabs(0) })
             val peer by viewModel.getPeerFlow(screen.deviceId).collectAsState(initial = null)
             ConversationScreen(
                 viewModel = viewModel,
                 peerId = screen.deviceId,
-                contactName = screen.contactName,
+                contactName = peer?.nickname ?: peer?.exchangedName?.takeIf { it.isNotBlank() } ?: screen.contactName,
                 isOnline = peer?.isDirectlyConnected ?: false,
                 lastSeen = peer?.lastSeenTimestamp ?: 0L,
-                onBack = { currentScreen = Screen.PeerList }
+                onBack = { currentScreen = Screen.MainTabs(0) }
             )
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun PeerListScreen(
+fun ChatsTab(
     viewModel: ComLinkViewModel,
-    onNavigateToAddContact: () -> Unit,
-    onNavigateToChat: (String, String) -> Unit,
-    onNavigateToSettings: () -> Unit
+    onNavigateToChat: (String, String) -> Unit
 ) {
     val peers by viewModel.peers.collectAsState(initial = emptyList())
-
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("ComLink", fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold) },
-                actions = {
-                    IconButton(onClick = onNavigateToSettings) {
-                        Icon(Icons.Default.Settings, contentDescription = "Settings")
+    
+    Column(modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+        Box(
+            modifier = Modifier.fillMaxWidth().border(1.dp, androidx.compose.ui.graphics.Color.Green).padding(16.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text("> RECENT CHATS <", color = androidx.compose.ui.graphics.Color.Green, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        }
+        
+        LazyColumn(modifier = Modifier.fillMaxSize()) {
+            items(peers) { peer ->
+                val displayName = peer.nickname ?: peer.exchangedName.takeIf { it.isNotBlank() } ?: peer.contactName
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onNavigateToChat(peer.deviceId, displayName) }
+                        .border(1.dp, androidx.compose.ui.graphics.Color.DarkGray)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column {
+                        Text(displayName, color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                        val statusText = if (peer.isDirectlyConnected) "[ONLINE]" else "[OFFLINE] ${formatTimestampShort(peer.lastSeenTimestamp)}"
+                        Text(statusText, color = if (peer.isDirectlyConnected) androidx.compose.ui.graphics.Color.Green else androidx.compose.ui.graphics.Color.Gray, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                     }
                 }
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(onClick = onNavigateToAddContact) {
-                Icon(Icons.Default.Add, contentDescription = "Add Contact")
-            }
-        }
-    ) { padding ->
-        LazyColumn(contentPadding = padding, modifier = Modifier.fillMaxSize()) {
-            items(peers) { peer ->
-                ListItem(
-                    headlineContent = { Text(peer.contactName, fontWeight = FontWeight.Bold) },
-                    supportingContent = { 
-                        Text(
-                            text = if (peer.isDirectlyConnected) "Online" else if (peer.lastSeenTimestamp > 0L) "Last seen ${formatTimestampShort(peer.lastSeenTimestamp)}" else "Offline",
-                            color = if (peer.isDirectlyConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 12.sp
-                        )
-                    },
-                    modifier = Modifier.clickable { onNavigateToChat(peer.deviceId, peer.contactName) }
-                )
-                Divider()
             }
         }
     }
@@ -262,14 +257,8 @@ fun QrScanner(onQrScanned: (String) -> Unit) {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AddContactScreen(
-    viewModel: ComLinkViewModel,
-    onBack: () -> Unit,
-    onContactSaved: () -> Unit
-) {
-    BackHandler(onBack = onBack)
+fun ContactsTab(viewModel: ComLinkViewModel) {
     val context = LocalContext.current
     var showScanner by remember { mutableStateOf(false) }
     var scannedData by remember { mutableStateOf<String?>(null) }
@@ -283,12 +272,12 @@ fun AddContactScreen(
     if (scannedData != null) {
         AlertDialog(
             onDismissRequest = { scannedData = null },
-            title = { Text("Verify Fingerprint") },
+            title = { Text("VERIFY FINGERPRINT", fontFamily = FontFamily.Monospace) },
             text = {
                 Column {
-                    Text("Manually verify this SHA-256 fingerprint with the peer before accepting:", style = MaterialTheme.typography.bodyMedium)
+                    Text("Manual verification required:", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text(fingerprint, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Text(fingerprint, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = androidx.compose.ui.graphics.Color.Green)
                     Spacer(modifier = Modifier.height(16.dp))
                     OutlinedTextField(
                         value = contactNameInput,
@@ -300,67 +289,68 @@ fun AddContactScreen(
             confirmButton = {
                 Button(onClick = {
                     viewModel.processScannedQr(scannedData!!, contactNameInput.ifBlank { "Unknown" })
-                    onContactSaved()
+                    scannedData = null
+                    showScanner = false
                 }) {
-                    Text("CONFIRM")
+                    Text("ACCEPT")
                 }
             },
             dismissButton = {
                 TextButton(onClick = { scannedData = null }) {
-                    Text("CANCEL")
+                    Text("REJECT")
                 }
             }
         )
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text("Add Contact") },
-                navigationIcon = {
-                    IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, contentDescription = "Back") }
-                }
-            )
-        }
-    ) { padding ->
-        Column(
-            modifier = Modifier.padding(padding).fillMaxSize(),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
+    Column(
+        modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Box(
+            modifier = Modifier.fillMaxWidth().border(1.dp, androidx.compose.ui.graphics.Color.Green).padding(16.dp),
+            contentAlignment = Alignment.Center
         ) {
-            if (!showScanner) {
-                Text("Your QR Identity", fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.height(16.dp))
-                
-                val qrBitmap = remember { QrUtils.generateQrBitmap(viewModel.getMyQrPayload()) }
-                Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = "QR Code", modifier = Modifier.size(250.dp))
-                
-                Spacer(modifier = Modifier.height(32.dp))
-                Button(onClick = { 
+            Text("> CONTACTS & PAIRING <", color = androidx.compose.ui.graphics.Color.Green, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        }
+        
+        if (!showScanner) {
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("YOUR QR IDENTITY", color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            val qrBitmap = remember { QrUtils.generateQrBitmap(viewModel.getMyQrPayload()) }
+            Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = "QR Code", modifier = Modifier.size(250.dp).border(2.dp, androidx.compose.ui.graphics.Color.Green))
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            Button(
+                onClick = { 
                     if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                         showScanner = true
                     } else {
                         cameraLauncher.launch(Manifest.permission.CAMERA)
                     }
-                }) {
-                    Text("Scan Peer QR")
-                }
-            } else {
-                Box(modifier = Modifier.fillMaxSize()) {
-                    QrScanner(
-                        onQrScanned = { result ->
-                            if (scannedData == null) {
-                                scannedData = result
-                                fingerprint = viewModel.generateFingerprint(result.substringAfter(":"))
-                            }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color.DarkGray)
+            ) {
+                Text("[ SCAN PEER QR ]", color = androidx.compose.ui.graphics.Color.Green, fontFamily = FontFamily.Monospace)
+            }
+        } else {
+            Box(modifier = Modifier.fillMaxSize().weight(1f)) {
+                QrScanner(
+                    onQrScanned = { result ->
+                        if (scannedData == null) {
+                            scannedData = result
+                            fingerprint = viewModel.generateFingerprint(result.substringAfter(":"))
                         }
-                    )
-                    Button(
-                        onClick = { showScanner = false },
-                        modifier = Modifier.align(Alignment.BottomCenter).padding(32.dp)
-                    ) {
-                        Text("Cancel Scan")
                     }
+                )
+                Button(
+                    onClick = { showScanner = false },
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(32.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color.Red.copy(alpha = 0.5f))
+                ) {
+                    Text("[ CANCEL SCAN ]", fontFamily = FontFamily.Monospace)
                 }
             }
         }

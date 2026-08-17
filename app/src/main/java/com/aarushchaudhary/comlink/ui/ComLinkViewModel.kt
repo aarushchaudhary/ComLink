@@ -127,7 +127,12 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     fun getMyQrPayload(): String {
         val pubKey = Base64.encodeToString(identity.getPublicKey(), Base64.NO_WRAP)
         val devId = identity.getDeviceId()
-        return "$devId:$pubKey"
+        val payload = com.aarushchaudhary.comlink.proto.ContactPayload(
+            device_id = devId,
+            public_key = pubKey,
+            display_name = "Cypherpunk User" // Placeholder, should be read from DataStore
+        )
+        return Base64.encodeToString(com.aarushchaudhary.comlink.proto.ContactPayload.ADAPTER.encode(payload), Base64.NO_WRAP)
     }
 
     fun generateFingerprint(peerPubKeyBase64: String): String {
@@ -142,12 +147,29 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     fun processScannedQr(qrData: String, contactName: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
+                // If it's old format "devId:pubKey"
                 val parts = qrData.split(":")
-                if (parts.size != 2) return@launch
-                val peerDeviceId = parts[0]
-                val peerPubKey = parts[1]
+                var peerDeviceId = ""
+                var peerPubKey = ""
+                var exchangedName = ""
                 
-                val peer = PeerEntity(peerDeviceId, peerPubKey, contactName)
+                if (parts.size >= 2) {
+                    peerDeviceId = parts[0]
+                    peerPubKey = parts[1]
+                } else {
+                    // Try parsing as protobuf ContactPayload base64
+                    try {
+                        val bytes = Base64.decode(qrData, Base64.NO_WRAP)
+                        val payload = com.aarushchaudhary.comlink.proto.ContactPayload.ADAPTER.decode(bytes)
+                        peerDeviceId = payload.device_id
+                        peerPubKey = payload.public_key
+                        exchangedName = payload.display_name
+                    } catch (e: Exception) {
+                        return@launch
+                    }
+                }
+                
+                val peer = PeerEntity(peerDeviceId, peerPubKey, contactName, exchangedName = exchangedName)
                 dao.insertPeer(peer)
                 
                 val state = dao.getSessionState(peerDeviceId)
@@ -156,6 +178,15 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            }
+        }
+    }
+
+    fun updateNickname(peerId: String, newNickname: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val peer = dao.getPeer(peerId)
+            if (peer != null) {
+                dao.insertPeer(peer.copy(nickname = newNickname))
             }
         }
     }
