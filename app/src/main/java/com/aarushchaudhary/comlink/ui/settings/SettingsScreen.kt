@@ -33,7 +33,9 @@ fun SettingsScreen(context: Context, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val accentColor = MaterialTheme.colorScheme.primary
     
-    val myName by context.dataStore.data.map { it[myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
+    val initialName by context.dataStore.data.map { it[myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
+    var localName by remember { mutableStateOf<String?>(null) }
+    val displayNameToUse = localName ?: initialName
 
     Column(
         modifier = Modifier.fillMaxSize().background(Color.Black).padding(16.dp),
@@ -52,8 +54,9 @@ fun SettingsScreen(context: Context, onBack: () -> Unit) {
         Spacer(Modifier.height(8.dp))
         
         OutlinedTextField(
-            value = myName,
+            value = displayNameToUse,
             onValueChange = { newName ->
+                localName = newName
                 scope.launch {
                     context.dataStore.edit { it[myDisplayNamePref] = newName }
                 }

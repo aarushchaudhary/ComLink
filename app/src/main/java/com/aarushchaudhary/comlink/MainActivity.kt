@@ -293,7 +293,7 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
     if (scannedData != null) {
         AlertDialog(
             onDismissRequest = { scannedData = null },
-            title = { Text("VERIFY FINGERPRINT", fontFamily = FontFamily.Monospace, color = accentColor) },
+            title = { Text("> VERIFY FINGERPRINT <", fontFamily = FontFamily.Monospace, color = accentColor, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
                     Text("Manual verification required:", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace, color = androidx.compose.ui.graphics.Color.LightGray)
@@ -303,53 +303,81 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
                     OutlinedTextField(
                         value = contactNameInput,
                         onValueChange = { contactNameInput = it },
-                        label = { Text("Contact Name") }
+                        label = { Text("Contact Name", color = androidx.compose.ui.graphics.Color.Gray, fontFamily = FontFamily.Monospace) },
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = androidx.compose.ui.graphics.Color.White,
+                            unfocusedTextColor = androidx.compose.ui.graphics.Color.White,
+                            cursorColor = accentColor,
+                            focusedBorderColor = accentColor,
+                            unfocusedBorderColor = androidx.compose.ui.graphics.Color.DarkGray
+                        ),
+                        textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace)
                     )
                 }
             },
             confirmButton = {
-                Button(onClick = {
-                    viewModel.processScannedQr(scannedData!!, contactNameInput.ifBlank { "Unknown" })
-                    scannedData = null
-                    showScanner = false
-                }) {
-                    Text("ACCEPT")
+                Button(
+                    onClick = {
+                        viewModel.processScannedQr(scannedData!!, contactNameInput.ifBlank { "Unknown" })
+                        scannedData = null
+                        showScanner = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color.DarkGray)
+                ) {
+                    Text("[ ACCEPT ]", color = accentColor, fontFamily = FontFamily.Monospace)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { scannedData = null }) {
-                    Text("REJECT")
+                TextButton(
+                    onClick = { scannedData = null }
+                ) {
+                    Text("[ REJECT ]", color = androidx.compose.ui.graphics.Color.Red, fontFamily = FontFamily.Monospace)
                 }
             },
-            containerColor = androidx.compose.ui.graphics.Color.DarkGray
+            containerColor = androidx.compose.ui.graphics.Color.Black,
+            modifier = Modifier.border(1.dp, accentColor)
         )
     }
 
     if (showEditNicknameFor != null) {
         AlertDialog(
             onDismissRequest = { showEditNicknameFor = null },
-            title = { Text("EDIT NICKNAME", fontFamily = FontFamily.Monospace, color = accentColor) },
+            title = { Text("> EDIT NICKNAME <", fontFamily = FontFamily.Monospace, color = accentColor, fontWeight = FontWeight.Bold) },
             text = {
                 OutlinedTextField(
                     value = nicknameInput,
                     onValueChange = { nicknameInput = it },
-                    label = { Text("Nickname") }
+                    label = { Text("Nickname", color = androidx.compose.ui.graphics.Color.Gray, fontFamily = FontFamily.Monospace) },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = androidx.compose.ui.graphics.Color.White,
+                        unfocusedTextColor = androidx.compose.ui.graphics.Color.White,
+                        cursorColor = accentColor,
+                        focusedBorderColor = accentColor,
+                        unfocusedBorderColor = androidx.compose.ui.graphics.Color.DarkGray
+                    ),
+                    textStyle = androidx.compose.ui.text.TextStyle(fontFamily = FontFamily.Monospace)
                 )
             },
             confirmButton = {
-                Button(onClick = {
-                    viewModel.updateNickname(showEditNicknameFor!!.deviceId, nicknameInput)
-                    showEditNicknameFor = null
-                }) {
-                    Text("SAVE")
+                Button(
+                    onClick = {
+                        viewModel.updateNickname(showEditNicknameFor!!.deviceId, nicknameInput)
+                        showEditNicknameFor = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color.DarkGray)
+                ) {
+                    Text("[ SAVE ]", color = accentColor, fontFamily = FontFamily.Monospace)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showEditNicknameFor = null }) {
-                    Text("CANCEL")
+                TextButton(
+                    onClick = { showEditNicknameFor = null }
+                ) {
+                    Text("[ CANCEL ]", color = androidx.compose.ui.graphics.Color.Gray, fontFamily = FontFamily.Monospace)
                 }
             },
-            containerColor = androidx.compose.ui.graphics.Color.DarkGray
+            containerColor = androidx.compose.ui.graphics.Color.Black,
+            modifier = Modifier.border(1.dp, accentColor)
         )
     }
 
