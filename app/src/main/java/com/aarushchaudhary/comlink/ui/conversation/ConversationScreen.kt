@@ -45,8 +45,9 @@ fun ConversationScreen(
     val clipboardManager = LocalClipboardManager.current
     var showContextMenuFor by remember { mutableStateOf<MessageEntity?>(null) }
     val accentColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.background
 
-    Column(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+    Column(modifier = Modifier.fillMaxSize().background(backgroundColor)) {
         // Cypherpunk Top Bar
         Row(
             modifier = Modifier
@@ -78,7 +79,7 @@ fun ConversationScreen(
                     Box(
                         modifier = Modifier
                             .border(1.dp, borderColor)
-                            .background(Color.Black)
+                            .background(backgroundColor)
                             .combinedClickable(
                                 onClick = {},
                                 onLongClick = { showContextMenuFor = msg }
@@ -124,7 +125,7 @@ fun ConversationScreen(
         }
         
         if (replyingTo != null) {
-            Box(modifier = Modifier.fillMaxWidth().border(1.dp, accentColor).background(Color.Black).padding(8.dp)) {
+            Box(modifier = Modifier.fillMaxWidth().border(1.dp, accentColor).background(backgroundColor).padding(8.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text("REPLYING TO: ${if (replyingTo!!.isFromMe) "YOU" else contactName}", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = accentColor, fontFamily = FontFamily.Monospace)
@@ -177,7 +178,7 @@ fun ConversationScreen(
     }
     
     if (showContextMenuFor != null) {
-        ModalBottomSheet(onDismissRequest = { showContextMenuFor = null }, containerColor = Color.Black) {
+        ModalBottomSheet(onDismissRequest = { showContextMenuFor = null }, containerColor = backgroundColor) {
             Column(Modifier.padding(bottom = 32.dp)) {
                 ListItem(
                     headlineContent = { Text("> REPLY", color = accentColor, fontFamily = FontFamily.Monospace) },
@@ -185,7 +186,7 @@ fun ConversationScreen(
                         replyingTo = showContextMenuFor
                         showContextMenuFor = null
                     },
-                    colors = ListItemDefaults.colors(containerColor = Color.Black)
+                    colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
                 ListItem(
                     headlineContent = { Text("> COPY TEXT", color = accentColor, fontFamily = FontFamily.Monospace) },
@@ -193,7 +194,7 @@ fun ConversationScreen(
                         clipboardManager.setText(AnnotatedString(showContextMenuFor!!.plaintext))
                         showContextMenuFor = null
                     },
-                    colors = ListItemDefaults.colors(containerColor = Color.Black)
+                    colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
             }
         }
