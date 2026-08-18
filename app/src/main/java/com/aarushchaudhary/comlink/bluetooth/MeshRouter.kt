@@ -4,10 +4,10 @@ import android.util.Log
 import com.aarushchaudhary.comlink.proto.Envelope
 import java.util.Collections
 import java.util.LinkedHashMap
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
-class MeshRouter(val localDeviceId: String) {
+class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
 
     // Listener for messages that are destined for this device
     var onMessageReceived: ((Envelope) -> Unit)? = null
@@ -56,7 +56,7 @@ class MeshRouter(val localDeviceId: String) {
                 val relayedEnvelope = envelope.copy(ttl = newTtl)
                 val encodedBytes = relayedEnvelope.encode()
                 // Broadcast to all connected sockets in background
-                kotlinx.coroutines.GlobalScope.launch {
+                scope.launch {
                     broadcastToNetwork?.invoke(encodedBytes)
                 }
             }

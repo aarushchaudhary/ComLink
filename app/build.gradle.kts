@@ -21,6 +21,9 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
         
         ksp {
             arg("room.schemaLocation", "$projectDir/schemas")
@@ -76,7 +79,6 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
 
     // Google Tink (Cryptography)
     implementation("com.google.crypto.tink:tink-android:$tinkVersion")

@@ -6,6 +6,9 @@ import com.aarushchaudhary.comlink.bluetooth.BluetoothService
 import com.aarushchaudhary.comlink.bluetooth.MeshRouter
 import com.aarushchaudhary.comlink.crypto.IdentityManager
 import com.aarushchaudhary.comlink.data.ComLinkDatabase
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 class ComLinkApp : Application() {
     
@@ -21,6 +24,8 @@ class ComLinkApp : Application() {
     lateinit var bluetoothService: BluetoothService
         private set
 
+    private val appScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     override fun onCreate() {
         super.onCreate()
         
@@ -32,7 +37,7 @@ class ComLinkApp : Application() {
         
         identityManager = IdentityManager(this)
         
-        meshRouter = MeshRouter(identityManager.getDeviceId())
+        meshRouter = MeshRouter(identityManager.getDeviceId(), appScope)
         
         bluetoothService = BluetoothService(this, meshRouter)
     }

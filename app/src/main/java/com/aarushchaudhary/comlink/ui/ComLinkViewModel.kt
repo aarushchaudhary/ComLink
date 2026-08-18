@@ -17,6 +17,9 @@ import okio.ByteString.Companion.toByteString
 import java.util.UUID
 
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.concurrent.ConcurrentHashMap
 
 class ComLinkViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -26,6 +29,19 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     private val router = app.meshRouter
 
     val peers: Flow<List<PeerEntity>> = dao.getAllPeers()
+
+    private val peerLocks = ConcurrentHashMap<String, Mutex>()
+    private val sessionCiphers = ConcurrentHashMap<String, SessionCipher>()
+
+    private fun getPeerLock(peerId: String) = peerLocks.getOrPut(peerId) { Mutex() }
+
+    private suspend fun getOrCreateCipher(peerId: String): SessionCipher? {
+        return sessionCiphers.getOrPut(peerId) {
+            val peer = dao.getPeer(peerId) ?: return null
+            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
+            SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+        }
+    }
 
     init {
         router.onMessageReceived = { envelope ->
@@ -50,11 +66,11 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         // Presence Monitor
         viewModelScope.launch(Dispatchers.IO) {
             while (isActive) {
-                kotlinx.coroutines.delay(5000)
-                val allPeers = dao.getAllPeersSync()
+                kotlinx.coroutines.delay(15000)
+                val connectedPeers = dao.getConnectedPeers()
                 val now = System.currentTimeMillis()
-                for (peer in allPeers) {
-                    if (peer.isDirectlyConnected && (now - peer.lastSeenTimestamp) > 15000) {
+                for (peer in connectedPeers) {
+                    if (now - peer.lastSeenTimestamp > 45000) {
                         dao.updatePeerConnectedStatus(peer.deviceId, false)
                     }
                 }
@@ -67,10 +83,8 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             val pending = dao.getPendingMessages(peerId)
             if (pending.isEmpty()) return@launch
             
-            val peer = dao.getPeer(peerId) ?: return@launch
             val state = dao.getSessionState(peerId) ?: return@launch
-            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
-            val cipher = SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+            val cipher = getOrCreateCipher(peerId) ?: return@launch
             
             var currentCounter = state.myNextCounter
             
@@ -199,16 +213,9 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         replyToSnippet: String? = null
     ) {
         viewModelScope.launch(Dispatchers.IO) {
-            val peer = dao.getPeer(peerId) ?: return@launch
-            val state = dao.getSessionState(peerId) ?: return@launch
-            
-            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
-            
-            val cipher = SessionCipher(
-                myPrivateKey = identity.getPrivateKey(),
-                myPublicKey = identity.getPublicKey(),
-                peerPublicKey = peerPubKey
-            )
+            getPeerLock(peerId).withLock {
+            val state = dao.getSessionState(peerId) ?: return@withLock
+            val cipher = getOrCreateCipher(peerId) ?: return@withLock
             
             val counter = state.myNextCounter
             
@@ -255,6 +262,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             if (success) {
                 dao.updateMessageStatus(envId, 1)
             }
+            }
         }
     }
 
@@ -264,13 +272,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             val peer = dao.getPeer(senderId) ?: return@launch
             val state = dao.getSessionState(senderId) ?: return@launch
             
-            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
-            
-            val cipher = SessionCipher(
-                myPrivateKey = identity.getPrivateKey(),
-                myPublicKey = identity.getPublicKey(),
-                peerPublicKey = peerPubKey
-            )
+            val cipher = getOrCreateCipher(senderId) ?: return@launch
             
             try {
                 val ciphertext = envelope.ciphertext?.toByteArray() ?: return@launch
@@ -335,10 +337,9 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     
     private fun sendAck(peerId: String, messageId: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val peer = dao.getPeer(peerId) ?: return@launch
-            val state = dao.getSessionState(peerId) ?: return@launch
-            val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
-            val cipher = SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+            getPeerLock(peerId).withLock {
+            val state = dao.getSessionState(peerId) ?: return@withLock
+            val cipher = getOrCreateCipher(peerId) ?: return@withLock
             
             val counter = state.myNextCounter
             val ciphertextBytes = cipher.encrypt("ACK:$messageId".toByteArray(Charsets.UTF_8), counter)
@@ -356,6 +357,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             
             dao.updateMyCounter(peerId, counter + 1)
             router.sendLocalMessage(envelope)
+            }
         }
     }
 }

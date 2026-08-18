@@ -38,6 +38,8 @@ class BluetoothService(
 
     private var gattServer: BluetoothGattServer? = null
     private val activeGatts = ConcurrentHashMap<String, GattConnection>()
+    private val pendingConnections = ConcurrentHashMap.newKeySet<String>()
+    private val packetCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
@@ -56,10 +58,14 @@ class BluetoothService(
     }
     
     // Map of Packet ID to MessageBuffer
-    private val rxBuffers = ConcurrentHashMap<Int, MessageBuffer>()
+    private data class TimedBuffer(val buffer: MessageBuffer, val createdAt: Long = System.currentTimeMillis())
+    private val rxBuffers = ConcurrentHashMap<Int, TimedBuffer>()
+    private val lastActivityPerPeer = ConcurrentHashMap<String, Long>()
 
     // Concurrency protection: Mutex for sequential characteristic writes
     private inner class GattConnection(val gatt: BluetoothGatt) {
+        var negotiatedMtu: Int = 23
+        val effectiveChunkSize: Int get() = (negotiatedMtu - 3 - 6).coerceAtLeast(20)
         val writeMutex = kotlinx.coroutines.sync.Mutex()
         val writeCompleted = Channel<Unit>(1)
 
@@ -69,7 +75,7 @@ class BluetoothService(
                 val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
                 if (characteristic != null) {
                     characteristic.value = chunk
-                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                     
                     // Drain old events
                     while(writeCompleted.tryReceive().isSuccess) {}
@@ -142,6 +148,7 @@ class BluetoothService(
 
     private val gattClientCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            pendingConnections.remove(gatt.device.address)
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 Log.d(TAG, "Connected as client to: ${gatt.device.address}")
                 val conn = GattConnection(gatt)
@@ -159,20 +166,21 @@ class BluetoothService(
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "MTU changed to $mtu for ${gatt.device.address}")
+                activeGatts[gatt.device.address]?.negotiatedMtu = mtu
+                // Send HELLO only to this peer, now that MTU is negotiated
+                serviceScope.launch {
+                    val conn = activeGatts[gatt.device.address] ?: return@launch
+                    val helloPayload = ("HELLO:" + meshRouter.localDeviceId).toByteArray()
+                    sendToSinglePeer(conn, helloPayload)
+                }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 Log.d(TAG, "Services discovered for ${gatt.device.address}")
-                // Request MTU after services discovered
+                gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                 gatt.requestMtu(512)
-                
-                // Send HELLO packet to identify ourselves
-                serviceScope.launch {
-                    val helloPayload = ("HELLO:" + meshRouter.localDeviceId).toByteArray()
-                    broadcast(helloPayload) // Broadcast will reach this new connection
-                }
             }
         }
 
@@ -203,7 +211,7 @@ class BluetoothService(
 
         heartbeatJob = serviceScope.launch {
             while (isActive) {
-                delay(5000)
+                delay(15000)
                 forceHeartbeat()
             }
         }
@@ -305,7 +313,8 @@ class BluetoothService(
         val payloadData = ByteArray(chunk.size - 6)
         byteBuffer.get(payloadData)
 
-        val buffer = rxBuffers.getOrPut(packetId) { MessageBuffer(totalChunks) }
+        val timedBuffer = rxBuffers.getOrPut(packetId) { TimedBuffer(MessageBuffer(totalChunks)) }
+        val buffer = timedBuffer.buffer
         
         if (chunkIndex in 0 until totalChunks) {
             buffer.chunks[chunkIndex] = payloadData
@@ -370,5 +379,26 @@ class BluetoothService(
         
         val results = jobs.awaitAll()
         return results.any { it } // Return true if at least one connection successfully received all chunks
+    }
+
+    private suspend fun sendToSinglePeer(connection: GattConnection, payload: ByteArray): Boolean {
+        val packetId = packetCounter.getAndIncrement()
+        val chunkSize = connection.effectiveChunkSize.coerceAtMost(MAX_CHUNK_PAYLOAD_SIZE)
+        val chunkPayloads = payload.toList().chunked(chunkSize).map { it.toByteArray() }
+        val totalChunks = chunkPayloads.size
+        if (totalChunks > 255) return false
+
+        val chunksToSend = chunkPayloads.mapIndexed { index, chunkData ->
+            val buffer = ByteBuffer.allocate(6 + chunkData.size)
+            buffer.putInt(packetId)
+            buffer.put(totalChunks.toByte())
+            buffer.put(index.toByte())
+            buffer.put(chunkData)
+            buffer.array()
+        }
+        for (chunk in chunksToSend) {
+            if (!connection.writeChunk(chunk)) return false
+        }
+        return true
     }
 }
