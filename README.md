@@ -1,280 +1,125 @@
-# ComLink
+# ComLink 📡
 
-> *"Privacy is necessary for an open society in the electronic age."* — A Cypherpunk's Manifesto
+ComLink is a decentralized, offline-first Bluetooth Low Energy (BLE) mesh messenger for Android. It allows devices to communicate securely without relying on cellular networks, Wi-Fi routers, or the internet. Messages and files hop from device to device to reach their destination.
 
-**ComLink** is a decentralized, off-grid mesh messenger for Android. No servers. No internet. No phone numbers. Just Bluetooth Low Energy, cryptography, and the devices in your pocket.
+## 🌟 Key Features
 
-Messages travel device-to-device over an encrypted BLE mesh network. If the recipient is out of direct range, nearby ComLink devices automatically relay the encrypted payload — up to 10 hops — without ever being able to read it.
-
-Built natively in Kotlin with Jetpack Compose. Designed for the moments when the network is down, the towers are off, or you simply refuse to trust them.
-
----
-
-## Features
-
-**Off-Grid Communication**
-Messages are transmitted exclusively over Bluetooth Low Energy. No cellular, no Wi-Fi, no internet connection of any kind.
-
-**End-to-End Encryption**
-Every message is encrypted with AES-256-GCM using keys derived from an X25519 ECDH key agreement. Your private key never leaves the device — it's wrapped by AES-256-GCM inside the Android Keystore hardware.
-
-**Multi-Hop Mesh Routing**
-When the recipient isn't in direct BLE range, intermediate ComLink devices relay the encrypted envelope. Each relay decrements a TTL counter (max 10 hops). Relay nodes can route the message but cannot decrypt its contents.
-
-**File & Media Sharing**
-Send images, videos, audio, and documents completely off-grid. Files are automatically split into 100KB chunks, encrypted, and reassembled on the receiver's end over the BLE mesh. Images are automatically compressed (scaled to max 1920px and JPEG optimized) for near-instant transfers.
-
-**Location Sharing**
-Share your current coordinates with a single tap. Location data is sent as an encrypted message and displayed as an interactive map bubble in the chat UI.
-
-**Identity via QR Code**
-No phone numbers. No email addresses. No accounts. Identity is a cryptographic keypair generated on-device. You exchange public keys out-of-band by scanning a peer's Protobuf-encoded QR code, then verify the relationship via a deterministic SHA-256 fingerprint.
-
-**Offline Message Queue**
-Messages sent while the recipient is out of range are persisted locally and automatically retransmitted when the peer reconnects.
-
-**Delivery Receipts**
-Encrypted ACK messages confirm delivery. The UI shows message status: `[WAIT]` → `[SENT]` → `[ACK]`.
-
-**Cypherpunk Aesthetic**
-A custom Jetpack Compose design system — black backgrounds, monospaced typography, hard borders, and a user-configurable accent color wheel. No Material defaults.
+*   **100% Offline & Decentralized:** Works completely off-the-grid using BLE GATT connections.
+*   **Mesh Routing:** Devices act as nodes. If Alice wants to message Charlie but is out of range, the message will securely hop through Bob (who cannot read it).
+*   **End-to-End Encrypted (E2EE):** All payloads are encrypted using AES-256-GCM with ECDH key exchange. Intermediate relay nodes only see ciphertext.
+*   **Rich Media Support:** Send images, videos, audio, and documents.
+*   **Location Sharing:** Share precise GPS coordinates that render as interactive map links.
+*   **Smart File Transfers:** Files are automatically chunked, encrypted, and blasted over BLE using high-throughput No-Response writes. Stuck transfers can be instantly jumpstarted.
 
 ---
 
-## How It Works
+## 🏗 System Architecture
 
-### 1. Identity Generation
+### Mesh Network Topology
+ComLink devices operate in a "Dual-Role" capacity, acting as both BLE GATT Servers and GATT Clients simultaneously. 
 
-On first launch, ComLink generates:
-
-- An **X25519 keypair** — the long-term identity for key agreement
-- A **random device ID** (16 bytes, Base64) — used for message routing
-- The private key is encrypted using **AES-256-GCM** via Google Tink, backed by the **Android Keystore** hardware security module
-
-```
-Private Key → Tink AEAD (AES-256-GCM) → Android Keystore HSM
-Public Key  → SharedPreferences (Base64)
-Device ID   → SharedPreferences (Base64)
-```
-
-### 2. Peer Discovery & Key Exchange
-
-ComLink runs as a **dual-role BLE device** — simultaneously advertising as a GATT server and scanning for other ComLink devices via a shared service UUID.
-
-To add a contact:
-1. Your peer opens their QR code (a Base64-encoded `ContactPayload` protobuf containing their device ID, public key, and display name)
-2. You scan it with ComLink's CameraX-powered scanner
-3. A **SHA-256 fingerprint** is computed from both public keys (lexicographically sorted) for out-of-band verification
-4. On confirmation, the peer's public key and device ID are stored in the local Room database
-
-### 3. Sending a Message
-
-```
-Plaintext
-    ↓
-SessionCipher.encrypt(plaintext, counter)
-    ├── X25519 ECDH → Shared Secret
-    ├── HKDF-SHA256 → 32-byte AES key + 8-byte session salt
-    ├── Nonce: [8B salt][1B direction][3B counter]
-    └── AES-256-GCM encrypt → Ciphertext + Auth Tag
-    ↓
-Envelope (Protobuf)
-    ├── sender_id, recipient_id
-    ├── ciphertext, nonce
-    ├── envelope_id (UUID), timestamp
-    ├── content_type (0=MESSAGE, 1=FILE_HEADER, 2=FILE_PART)
-    └── ttl = 10
-    ↓
-Wire encode → BLE chunking (500B chunks + 6B header) → GATT write
+```mermaid
+graph TD
+    A[Node A<br>Sender] <-->|BLE Connection| B(Node B<br>Relay)
+    B <-->|BLE Connection| C[Node C<br>Receiver]
+    B <-->|BLE Connection| D(Node D<br>Relay)
+    
+    style A fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
+    style C fill:#2196F3,stroke:#1976D2,stroke-width:2px,color:#fff
 ```
 
-**Nonce construction** ensures uniqueness without coordination:
-- **Session salt** (8 bytes): derived from HKDF, shared between peers
-- **Direction byte** (1 byte): `0x01` or `0x02`, assigned by lexicographic ordering of public keys — guarantees both sides use different nonces even at the same counter value
-- **Counter** (3 bytes): strictly monotonic, supports ~16 million messages per session
+*When Node A sends a message to Node C, Node B receives it, checks the `recipient_id`, sees it is not the intended target, decrements the TTL (Time-To-Live), and broadcasts it forward.*
 
-### 4. File Transfers
+### The Protocol Stack
+ComLink relies on a custom multi-layered networking stack:
 
-File transfers utilize a specialized multi-envelope protocol:
-1. Sender chunks the file into ≤100KB parts. Images are compressed prior to chunking.
-2. A `FileHeader` envelope is sent containing metadata (filename, size, part count, thumbnail).
-3. `FilePart` envelopes are sent sequentially, each encrypted with AES-256-GCM. An aggressive 50ms throttle minimizes BLE congestion while maximizing throughput.
-4. Receiver buffers the parts in the cache directory and reassembles the final file once all parts arrive.
-
-### 5. Mesh Routing
-
-When a device receives an envelope:
-
-1. **Deduplication** — the `envelope_id` is checked against an LRU cache (10,000 entries). If seen before, the envelope is dropped.
-2. **Destination check** — if `recipient_id` matches this device, decrypt and deliver.
-3. **Relay** — if not for this device, decrement TTL. If TTL > 0, re-broadcast to all connected peers. The ciphertext is never touched.
-
-```
-Device A ──BLE──▶ Device B ──BLE──▶ Device C ──BLE──▶ Device D
-(sender)         (relay)           (relay)           (recipient)
-                 Can't decrypt     Can't decrypt     Decrypts ✓
-                 TTL: 10→9         TTL: 9→8
-```
-
-### 6. Anti-Replay Protection
-
-Each session tracks two counters in the database:
-- `myNextCounter` — the next counter this device will use for sending
-- `peerHighestCounter` — the highest counter received from the peer
-
-Any incoming message with a counter ≤ `peerHighestCounter` is silently dropped as a replay.
+1. **Application Layer (UI & DB):** Jetpack Compose, MVVM, Room Database.
+2. **Encryption Layer (`SessionCipher`):** ECDH shared secret derivation, AES-GCM encryption, monotonic replay-protection counters.
+3. **Routing Layer (`MeshRouter`):** Protobuf Envelope decoding, deduplication (LRU cache), TTL management, targeted vs. broadcast routing.
+4. **Transport Layer (`BluetoothService`):** MTU negotiation, 500-byte packet chunking, payload reassembly, connection mutexing.
 
 ---
 
-## Architecture
+## 🔒 Security & Data Flow
 
+All communication is wrapped in a Protobuf `Envelope`. Only the `envelope_id`, `sender_id`, `recipient_id`, and `ttl` are visible to the mesh. The actual data is encrypted ciphertext.
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant R as Mesh Router
+    participant D as Destination
+
+    S->>S: 1. Generate AES-256-GCM Ciphertext
+    S->>S: 2. Wrap in Protobuf Envelope
+    S->>R: 3. Broadcast(Envelope)
+    R->>R: 4. Check LRU Cache (Deduplicate)
+    R->>R: 5. Decrement TTL
+    R->>D: 6. Relay(Envelope)
+    D->>D: 7. Decrypt & Verify Counter
 ```
-com.aarushchaudhary.comlink/
-│
-├── ComLinkApp.kt                    # Application class, dependency wiring
-├── MainActivity.kt                  # Entry point, permissions, navigation, tabs
-│
-├── bluetooth/
-│   ├── BluetoothService.kt          # BLE GATT server/client, chunking, heartbeat
-│   └── MeshRouter.kt                # LRU dedup, multi-hop relay, message routing
-│
-├── crypto/
-│   ├── IdentityManager.kt           # X25519 keygen, Keystore wrapping, fingerprints
-│   └── SessionCipher.kt             # ECDH, HKDF, AES-256-GCM encrypt/decrypt
-│
-├── data/
-│   ├── ComLinkDatabase.kt           # Room entities (peers, sessions, messages, transfers)
-│   └── FileTransferManager.kt       # Multi-envelope file chunking, reassembly, image compression
-│
-├── ui/
-│   ├── ComLinkViewModel.kt          # Central orchestrator — send, receive, presence
-│   ├── CypherpunkComponents.kt      # Bottom bar, color wheel
-│   ├── QrImageAnalyzer.kt           # CameraX image analysis → ZXing decode
-│   ├── QrUtils.kt                   # QR bitmap generation
-│   ├── conversation/
-│   │   └── ConversationScreen.kt    # Chat UI — text bubbles, media bubbles, location map UI
-│   ├── settings/
-│   │   └── SettingsScreen.kt        # Display name, accent color, about
-│   └── theme/
-│       └── Theme.kt                 # DataStore-backed dynamic theming
-│
-└── proto/
-    └── comlink.proto                # Envelope, ContactPayload, AckMessage, FileHeader, FilePart
-```
-
-### Tech Stack
-
-| Layer | Technology |
-|---|---|
-| Language | Kotlin 2.0 |
-| UI | Jetpack Compose (100% custom components) |
-| Networking | Android BLE — `BluetoothGattServer` + `BluetoothLeScanner` (dual-role) |
-| Cryptography | Google Tink — X25519, AES-256-GCM, HKDF-SHA256, Android Keystore |
-| Database | Room (SQLite) — 4 tables, auto-migrations, reactive `Flow` queries |
-| Serialization | Square Wire (Protocol Buffers 3) |
-| Camera | CameraX + ZXing (QR scanning & generation) |
-| State | Kotlin Coroutines, Flows, ViewModel, Jetpack DataStore Preferences |
-
-### Database Schema
-
-| Table | Purpose |
-|---|---|
-| `peers` | Stores contacts — device ID, public key, display name, nickname, online status, last seen |
-| `session_states` | Tracks send/receive counters per peer for replay protection |
-| `messages` | Persists all messages, media paths, location coords, and foreign key to `peers` |
-| `file_transfers` | Tracks incoming and outgoing multi-part file transfers |
-
-### BLE Protocol
-
-ComLink uses a custom chunking protocol over BLE GATT:
-
-```
-┌──────────────────────────────────────────┐
-│              Chunk Header (6B)           │
-├──────────┬──────────────┬────────────────┤
-│ packetId │ totalChunks  │  chunkIndex    │
-│  (4B)    │    (1B)      │    (1B)        │
-├──────────┴──────────────┴────────────────┤
-│              Payload (up to 500B)        │
-└──────────────────────────────────────────┘
-```
-
-- **MTU**: Negotiated up to 512 bytes per connection
-- **Chunk size**: Adapts to the negotiated MTU per peer
-- **Reassembly**: Receiver buffers chunks by `packetId` until all arrive, then reassembles
-- **Heartbeat**: Periodic PING packets detect stale connections
 
 ---
 
-## Build Instructions
+## 📁 File Transfer Protocol
+
+Transferring large files (like videos) over BLE requires careful orchestration to avoid overwhelming the MTU limits and GATT queues. 
+
+ComLink uses a bespoke streaming protocol. It splits files into ~100KB `FilePart` chunks. To maximize speed, it uses **Targeted Direct Sends** and **`WRITE_TYPE_NO_RESPONSE`**, completely bypassing BLE acknowledgment bottlenecks.
+
+```mermaid
+sequenceDiagram
+    participant S as Sender
+    participant R as Receiver
+
+    Note over S,R: 1. Handshake Phase
+    S->>R: FILE_HEADER (Metadata, Size, Thumbnail)
+    R-->>S: ACK / READ Receipt (Status -> SEEN)
+    
+    Note over S,R: 2. High-Speed Transmission Phase
+    S->>R: FILE_PART 0 (100KB, Encrypted, No-Response)
+    S->>R: FILE_PART 1 (100KB, Encrypted, No-Response)
+    S->>R: ... FILE_PART N
+    
+    Note over S,R: 3. Reassembly Phase
+    R->>R: Append parts to cache/transfers/
+    R->>R: Verify receivedParts == partCount
+    R->>R: Assemble final file & Render UI
+```
+
+### Jumpstart & Resilience
+Because ComLink prioritizes speed over reliability for media chunks (using unacknowledged writes), interference can cause dropped packets.
+* If a transfer stalls, the UI provides a **Jumpstart Transfer** option.
+* `FileTransferManager` queries the SQLite database for the `lastSentPartIndex`.
+* It opens the file via `RandomAccessFile` and blasts only the remaining missing chunks.
+
+---
+
+## 🛠 Tech Stack
+
+* **Language:** Kotlin
+* **UI Toolkit:** Jetpack Compose
+* **Architecture:** MVVM, Coroutines, Flow
+* **Local Storage:** Room Database
+* **Serialization:** Square Wire (Protobuf)
+* **Cryptography:** `javax.crypto` (AES/GCM/NoPadding, ECDH)
+* **Networking:** Android `BluetoothGatt`, `BluetoothLeAdvertiser`, `BluetoothLeScanner`
+
+## 🚀 Setup & Compilation
 
 ### Requirements
+* Android Studio Iguana (or newer)
+* Minimum SDK: 26 (Android 8.0)
+* Target SDK: 34 (Android 14)
 
-- Android Studio (Ladybug or newer)
-- Android SDK 34+
-- A physical Android device — **emulators do not support BLE**
-- Minimum two devices to test peer-to-peer messaging
-
-### Build
-
-```bash
-# Clone
-git clone https://github.com/aarushchaudhary/ComLink.git
-cd ComLink
-
-# Build debug APK
-./gradlew assembleDebug
-
-# Build release APK
-./gradlew assembleRelease
-
-# Install on connected device
-./gradlew installDebug
-```
-
-### Permissions
-
+### Permissions Needed
 ComLink requests the following permissions at runtime:
+* `BLUETOOTH_SCAN`, `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`
+* `ACCESS_FINE_LOCATION`, `ACCESS_COARSE_LOCATION` (Required for BLE scanning on older OS versions)
+* `READ_MEDIA_IMAGES`, `READ_MEDIA_VIDEO`, `READ_MEDIA_AUDIO`
 
-| Permission | Purpose |
-|---|---|
-| `BLUETOOTH_CONNECT` | Connect to nearby BLE devices (Android 12+) |
-| `BLUETOOTH_ADVERTISE` | Advertise as a GATT server for peer discovery |
-| `BLUETOOTH_SCAN` | Scan for nearby ComLink devices |
-| `CAMERA` | Scan QR codes for peer key exchange |
-| `ACCESS_FINE_LOCATION` | Required for sending Location coordinates to peers |
-| `READ_MEDIA_*` | Required for picking Images, Video, Audio, and Documents to send |
-
----
-
-## Security Model
-
-| Property | Implementation |
-|---|---|
-| **Key Generation** | X25519 keypair via Google Tink |
-| **Key Storage** | Private key encrypted with AES-256-GCM, master key in Android Keystore HSM |
-| **Key Exchange** | Out-of-band via QR code (Protobuf-encoded `ContactPayload`) |
-| **Key Verification** | Deterministic SHA-256 fingerprint from lexicographically sorted public keys |
-| **Key Agreement** | X25519 Elliptic Curve Diffie-Hellman |
-| **Key Derivation** | HKDF-SHA256 (40 bytes: 32B AES key + 8B nonce salt) |
-| **Message Encryption** | AES-256-GCM with 128-bit authentication tag |
-| **Nonce Construction** | Deterministic 96-bit: `[8B salt][1B direction][3B counter]` |
-| **Replay Protection** | Strictly monotonic counter per session; stale counters rejected |
-| **Routing Privacy** | Relay nodes see `Envelope` headers only; ciphertext is opaque |
-| **Broadcast Storm Prevention** | LRU cache (10,000 envelope IDs) deduplicates relayed messages |
-
-### What ComLink Does Not Protect Against
-
-- **Traffic analysis** — an observer can see that two devices are communicating over BLE, even if the content is encrypted
-- **Device compromise** — if an attacker gains root access to your device, they can extract the decrypted private key from memory
-- **Long-term key compromise** — ComLink does not currently implement forward secrecy (e.g., Double Ratchet). Compromising a private key decrypts all past and future messages for that peer.
-
----
-
-## License
-
-ComLink is licensed under the [GNU General Public License v3.0](LICENSE).
-
----
-
-> *Developed by [Aarush Chaudhary](https://github.com/aarushchaudhary)*
+### Building
+1. Clone the repository.
+2. Open in Android Studio.
+3. Sync Gradle projects.
+4. Hit **Run**. Wire will automatically generate the Kotlin classes from the `.proto` schemas during the build.
