@@ -18,6 +18,7 @@ enum class ThemeMode { SYSTEM, LIGHT, DARK }
 val customAccentColorPref = intPreferencesKey("custom_accent_color")
 val themeModePref = stringPreferencesKey("theme_mode")
 val myDisplayNamePref = stringPreferencesKey("my_display_name")
+val onboardingCompletePref = stringPreferencesKey("onboarding_complete")
 
 @Composable
 fun ComLinkTheme(

@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("com.google.devtools.ksp")
     id("com.squareup.wire")
@@ -43,8 +42,10 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+        }
     }
     buildFeatures {
         compose = true
@@ -62,7 +63,7 @@ wire {
 
 dependencies {
     val composeBomVersion = "2024.06.00"
-    val roomVersion = "2.6.1"
+    val roomVersion = "2.8.4"
     val cameraxVersion = "1.4.0"
     val tinkVersion = "1.9.0"
 

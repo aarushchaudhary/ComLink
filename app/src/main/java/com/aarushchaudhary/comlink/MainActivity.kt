@@ -43,8 +43,10 @@ import com.aarushchaudhary.comlink.ui.ComLinkViewModel
 import com.aarushchaudhary.comlink.ui.QrImageAnalyzer
 import com.aarushchaudhary.comlink.ui.QrUtils
 import com.aarushchaudhary.comlink.ui.conversation.ConversationScreen
+import com.aarushchaudhary.comlink.ui.onboarding.OnboardingScreen
 import com.aarushchaudhary.comlink.ui.settings.SettingsScreen
 import com.aarushchaudhary.comlink.ui.theme.ComLinkTheme
+import com.aarushchaudhary.comlink.ui.theme.onboardingCompletePref
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -61,70 +63,32 @@ class MainActivity : ComponentActivity() {
         setContent {
             ComLinkTheme(context = this) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PermissionGate(
-                        onPermissionsGranted = {
+                    val onboardingDone by this@MainActivity.dataStore.data
+                        .map { it[onboardingCompletePref] == "true" }
+                        .collectAsState(initial = null)
+
+                    when (onboardingDone) {
+                        null -> { /* Loading prefs, show nothing */ }
+                        false -> {
+                            OnboardingScreen(
+                                context = this@MainActivity,
+                                accentColor = MaterialTheme.colorScheme.primary
+                            ) {
+                                // onComplete triggers recomposition via datastore
+                            }
+                        }
+                        true -> {
                             viewModel.startBluetoothIfPermitted()
                             ComLinkAppUi(viewModel)
                         }
-                    )
+                    }
                 }
             }
         }
     }
 }
 
-@Composable
-fun PermissionGate(onPermissionsGranted: @Composable () -> Unit) {
-    val context = LocalContext.current
-    
-    val bluetoothPermissions = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-        listOf(
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.BLUETOOTH_ADVERTISE,
-            Manifest.permission.BLUETOOTH_SCAN
-        )
-    } else {
-        listOf(
-            Manifest.permission.BLUETOOTH,
-            Manifest.permission.BLUETOOTH_ADMIN,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        )
-    }
 
-    var hasPermissions by remember {
-        mutableStateOf(bluetoothPermissions.all {
-            ContextCompat.checkSelfPermission(context, it) == PackageManager.PERMISSION_GRANTED
-        })
-    }
-
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { results ->
-        hasPermissions = results.values.all { it }
-    }
-
-    if (hasPermissions) {
-        onPermissionsGranted()
-    } else {
-        Column(
-            modifier = Modifier.fillMaxSize().padding(16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Text("Permissions Required", style = MaterialTheme.typography.headlineMedium)
-            Spacer(modifier = Modifier.height(16.dp))
-            Text(
-                "ComLink requires Bluetooth permissions to connect to nearby peers. We do not use the internet or central servers.",
-                style = MaterialTheme.typography.bodyMedium,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(32.dp))
-            Button(onClick = { launcher.launch(bluetoothPermissions.toTypedArray()) }) {
-                Text("Grant Permissions")
-            }
-        }
-    }
-}
 
 sealed class Screen {
     data class MainTabs(val tabIndex: Int = 0) : Screen()
@@ -166,19 +130,33 @@ fun ComLinkAppUi(viewModel: ComLinkViewModel) {
         }
         is Screen.Chat -> {
             BackHandler(onBack = { currentScreen = Screen.MainTabs(0) })
-            val peer by viewModel.getPeerFlow(screen.deviceId).collectAsState(initial = null)
-            ConversationScreen(
-                viewModel = viewModel,
-                peerId = screen.deviceId,
-                contactName = peer?.nickname ?: peer?.exchangedName?.takeIf { it.isNotBlank() } ?: screen.contactName,
-                isOnline = peer?.isDirectlyConnected ?: false,
-                lastSeen = peer?.lastSeenTimestamp ?: 0L,
-                onBack = { currentScreen = Screen.MainTabs(0) }
-            )
+            val isSaved = screen.deviceId == ComLinkViewModel.SAVED_MESSAGES_ID
+            if (isSaved) {
+                ConversationScreen(
+                    viewModel = viewModel,
+                    peerId = screen.deviceId,
+                    contactName = "SAVED MESSAGES",
+                    isOnline = false,
+                    lastSeen = 0L,
+                    onBack = { currentScreen = Screen.MainTabs(0) },
+                    isSavedMessages = true
+                )
+            } else {
+                val peer by viewModel.getPeerFlow(screen.deviceId).collectAsState(initial = null)
+                ConversationScreen(
+                    viewModel = viewModel,
+                    peerId = screen.deviceId,
+                    contactName = peer?.nickname ?: peer?.exchangedName?.takeIf { it.isNotBlank() } ?: screen.contactName,
+                    isOnline = peer?.isDirectlyConnected ?: false,
+                    lastSeen = peer?.lastSeenTimestamp ?: 0L,
+                    onBack = { currentScreen = Screen.MainTabs(0) }
+                )
+            }
         }
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun ChatsTab(
     viewModel: ComLinkViewModel,
@@ -188,6 +166,12 @@ fun ChatsTab(
     val accentColor = MaterialTheme.colorScheme.primary
     val backgroundColor = MaterialTheme.colorScheme.background
     
+    var showContextMenuFor by remember { mutableStateOf<com.aarushchaudhary.comlink.data.PeerEntity?>(null) }
+    
+    val sortedPeers = peers
+        .filter { it.deviceId != ComLinkViewModel.SAVED_MESSAGES_ID }
+        .sortedWith(compareByDescending<com.aarushchaudhary.comlink.data.PeerEntity> { it.isPinned }.thenByDescending { it.lastMessageTimestamp })
+
     Column(modifier = Modifier.fillMaxSize().background(backgroundColor)) {
         Box(
             modifier = Modifier.fillMaxWidth().border(1.dp, accentColor).padding(16.dp),
@@ -197,22 +181,60 @@ fun ChatsTab(
         }
         
         LazyColumn(modifier = Modifier.fillMaxSize()) {
-            items(peers) { peer ->
-                val displayName = peer.nickname ?: peer.exchangedName.takeIf { it.isNotBlank() } ?: peer.contactName
+            item {
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clickable { onNavigateToChat(peer.deviceId, displayName) }
-                        .border(1.dp, androidx.compose.ui.graphics.Color.DarkGray)
+                        .clickable { onNavigateToChat(ComLinkViewModel.SAVED_MESSAGES_ID, "SAVED MESSAGES") }
+                        .border(1.dp, accentColor)
                         .padding(16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Column {
-                        Text(displayName, color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                        Text("SAVED MESSAGES", color = accentColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                        Text("[LOCAL STORAGE]", color = accentColor, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                    }
+                }
+            }
+            items(sortedPeers) { peer ->
+                val displayName = peer.nickname ?: peer.exchangedName.takeIf { it.isNotBlank() } ?: peer.contactName
+                val exchangedLabel = if (peer.exchangedName.isNotBlank() && displayName != peer.exchangedName) " (${peer.exchangedName})" else ""
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .combinedClickable(
+                            onClick = { onNavigateToChat(peer.deviceId, displayName) },
+                            onLongClick = { showContextMenuFor = peer }
+                        )
+                        .border(1.dp, androidx.compose.ui.graphics.Color.DarkGray)
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(displayName + exchangedLabel, color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                         val statusText = if (peer.isDirectlyConnected) "[ONLINE]" else "[OFFLINE] ${formatTimestampShort(peer.lastSeenTimestamp)}"
                         Text(statusText, color = if (peer.isDirectlyConnected) accentColor else androidx.compose.ui.graphics.Color.Gray, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
                     }
+                    if (peer.isPinned) {
+                        Text("[PINNED]", color = accentColor, fontSize = 10.sp, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                    }
                 }
+            }
+        }
+    }
+    
+    if (showContextMenuFor != null) {
+        ModalBottomSheet(onDismissRequest = { showContextMenuFor = null }, containerColor = backgroundColor) {
+            Column(Modifier.padding(bottom = 32.dp)) {
+                val isPinned = showContextMenuFor!!.isPinned
+                ListItem(
+                    headlineContent = { Text(if (isPinned) "> UNPIN CHAT" else "> PIN CHAT", color = accentColor, fontFamily = FontFamily.Monospace) },
+                    modifier = Modifier.clickable {
+                        viewModel.togglePin(showContextMenuFor!!.deviceId, !isPinned)
+                        showContextMenuFor = null
+                    },
+                    colors = ListItemDefaults.colors(containerColor = backgroundColor)
+                )
             }
         }
     }
@@ -457,6 +479,7 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
             LazyColumn(modifier = Modifier.fillMaxWidth().weight(1f)) {
                 items(peers) { peer ->
                     val displayName = peer.nickname ?: peer.exchangedName.takeIf { it.isNotBlank() } ?: peer.contactName
+                    val exchangedLabel = if (peer.exchangedName.isNotBlank() && displayName != peer.exchangedName) " (${peer.exchangedName})" else ""
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -472,7 +495,7 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column {
-                            Text(displayName, color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+                            Text(displayName + exchangedLabel, color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                             Text(peer.deviceId.take(8) + "...", color = androidx.compose.ui.graphics.Color.Gray, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
                         }
                     }

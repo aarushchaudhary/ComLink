@@ -3,26 +3,18 @@ syntax = "proto3";
 package com.aarushchaudhary.comlink.proto;
 
 message Envelope {
-  // SHA-256 hash or device ID of the sender (to route messages)
   string sender_id = 1;
-  
-  // SHA-256 hash or device ID of the recipient
   string recipient_id = 2;
-  
-  // Encrypted AES-256-GCM payload
   bytes ciphertext = 3;
-  
-  // 96-bit deterministic nonce (session salt + direction + counter)
   bytes nonce = 4;
-  
-  // Unix timestamp of message generation
   int64 timestamp = 5;
-  
-  // Unique identifier to prevent broadcast storms (LRU cache)
   string envelope_id = 6;
-  
-  // Multi-hop time-to-live counter
   int32 ttl = 7;
+  // Content types:
+  // 0 = MESSAGE (text/ack/read receipt, default)
+  // 1 = FILE_HEADER (metadata for file transfer)
+  // 2 = FILE_PART (chunk of file data)
+  int32 content_type = 8;
 }
 
 message ContactPayload {
@@ -34,4 +26,22 @@ message ContactPayload {
 message AckMessage {
   string message_id = 1;
   int64 timestamp = 2;
+}
+
+// Sent once before file data begins. Encrypted inside Envelope.ciphertext.
+message FileHeader {
+  string transfer_id = 1;       // UUID linking all parts of this transfer
+  string file_name = 2;         // Original filename
+  string mime_type = 3;         // e.g. "image/jpeg", "application/pdf", "audio/aac"
+  int64  file_size = 4;         // Total file size in bytes
+  int32  part_count = 5;        // Number of FILE_PART envelopes to expect
+  bytes  thumbnail = 6;         // Optional: low-res JPEG thumbnail (≤ 8 KB for images)
+  string message_id = 7;        // The Message ID this file belongs to (for Room DB linking)
+}
+
+// One piece of a file transfer. Encrypted inside Envelope.ciphertext.
+message FilePart {
+  string transfer_id = 1;       // Links back to the FileHeader
+  int32  part_index = 2;        // 0-based index of this part
+  bytes  data = 3;              // File data payload (≤ 100 KB)
 }

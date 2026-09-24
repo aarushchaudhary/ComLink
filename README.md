@@ -21,6 +21,12 @@ Every message is encrypted with AES-256-GCM using keys derived from an X25519 EC
 **Multi-Hop Mesh Routing**
 When the recipient isn't in direct BLE range, intermediate ComLink devices relay the encrypted envelope. Each relay decrements a TTL counter (max 10 hops). Relay nodes can route the message but cannot decrypt its contents.
 
+**File & Media Sharing**
+Send images, videos, audio, and documents completely off-grid. Files are automatically split into 100KB chunks, encrypted, and reassembled on the receiver's end over the BLE mesh. Images are automatically compressed (scaled to max 1920px and JPEG optimized) for near-instant transfers.
+
+**Location Sharing**
+Share your current coordinates with a single tap. Location data is sent as an encrypted message and displayed as an interactive map bubble in the chat UI.
+
 **Identity via QR Code**
 No phone numbers. No email addresses. No accounts. Identity is a cryptographic keypair generated on-device. You exchange public keys out-of-band by scanning a peer's Protobuf-encoded QR code, then verify the relationship via a deterministic SHA-256 fingerprint.
 
@@ -76,6 +82,7 @@ Envelope (Protobuf)
     ├── sender_id, recipient_id
     ├── ciphertext, nonce
     ├── envelope_id (UUID), timestamp
+    ├── content_type (0=MESSAGE, 1=FILE_HEADER, 2=FILE_PART)
     └── ttl = 10
     ↓
 Wire encode → BLE chunking (500B chunks + 6B header) → GATT write
@@ -86,7 +93,15 @@ Wire encode → BLE chunking (500B chunks + 6B header) → GATT write
 - **Direction byte** (1 byte): `0x01` or `0x02`, assigned by lexicographic ordering of public keys — guarantees both sides use different nonces even at the same counter value
 - **Counter** (3 bytes): strictly monotonic, supports ~16 million messages per session
 
-### 4. Mesh Routing
+### 4. File Transfers
+
+File transfers utilize a specialized multi-envelope protocol:
+1. Sender chunks the file into ≤100KB parts. Images are compressed prior to chunking.
+2. A `FileHeader` envelope is sent containing metadata (filename, size, part count, thumbnail).
+3. `FilePart` envelopes are sent sequentially, each encrypted with AES-256-GCM. An aggressive 50ms throttle minimizes BLE congestion while maximizing throughput.
+4. Receiver buffers the parts in the cache directory and reassembles the final file once all parts arrive.
+
+### 5. Mesh Routing
 
 When a device receives an envelope:
 
@@ -101,7 +116,7 @@ Device A ──BLE──▶ Device B ──BLE──▶ Device C ──BLE──
                  TTL: 10→9         TTL: 9→8
 ```
 
-### 5. Anti-Replay Protection
+### 6. Anti-Replay Protection
 
 Each session tracks two counters in the database:
 - `myNextCounter` — the next counter this device will use for sending
@@ -128,7 +143,8 @@ com.aarushchaudhary.comlink/
 │   └── SessionCipher.kt             # ECDH, HKDF, AES-256-GCM encrypt/decrypt
 │
 ├── data/
-│   └── ComLinkDatabase.kt           # Room entities (peers, sessions, messages), DAO
+│   ├── ComLinkDatabase.kt           # Room entities (peers, sessions, messages, transfers)
+│   └── FileTransferManager.kt       # Multi-envelope file chunking, reassembly, image compression
 │
 ├── ui/
 │   ├── ComLinkViewModel.kt          # Central orchestrator — send, receive, presence
@@ -136,14 +152,14 @@ com.aarushchaudhary.comlink/
 │   ├── QrImageAnalyzer.kt           # CameraX image analysis → ZXing decode
 │   ├── QrUtils.kt                   # QR bitmap generation
 │   ├── conversation/
-│   │   └── ConversationScreen.kt    # Chat UI — bubbles, replies, context menu
+│   │   └── ConversationScreen.kt    # Chat UI — text bubbles, media bubbles, location map UI
 │   ├── settings/
 │   │   └── SettingsScreen.kt        # Display name, accent color, about
 │   └── theme/
 │       └── Theme.kt                 # DataStore-backed dynamic theming
 │
 └── proto/
-    └── comlink.proto                # Envelope, ContactPayload, AckMessage
+    └── comlink.proto                # Envelope, ContactPayload, AckMessage, FileHeader, FilePart
 ```
 
 ### Tech Stack
@@ -154,7 +170,7 @@ com.aarushchaudhary.comlink/
 | UI | Jetpack Compose (100% custom components) |
 | Networking | Android BLE — `BluetoothGattServer` + `BluetoothLeScanner` (dual-role) |
 | Cryptography | Google Tink — X25519, AES-256-GCM, HKDF-SHA256, Android Keystore |
-| Database | Room (SQLite) — 3 tables, auto-migrations, reactive `Flow` queries |
+| Database | Room (SQLite) — 4 tables, auto-migrations, reactive `Flow` queries |
 | Serialization | Square Wire (Protocol Buffers 3) |
 | Camera | CameraX + ZXing (QR scanning & generation) |
 | State | Kotlin Coroutines, Flows, ViewModel, Jetpack DataStore Preferences |
@@ -165,7 +181,8 @@ com.aarushchaudhary.comlink/
 |---|---|
 | `peers` | Stores contacts — device ID, public key, display name, nickname, online status, last seen |
 | `session_states` | Tracks send/receive counters per peer for replay protection |
-| `messages` | Persists all messages with delivery status, reply metadata, and foreign key to `peers` (cascade delete) |
+| `messages` | Persists all messages, media paths, location coords, and foreign key to `peers` |
+| `file_transfers` | Tracks incoming and outgoing multi-part file transfers |
 
 ### BLE Protocol
 
@@ -225,8 +242,8 @@ ComLink requests the following permissions at runtime:
 | `BLUETOOTH_ADVERTISE` | Advertise as a GATT server for peer discovery |
 | `BLUETOOTH_SCAN` | Scan for nearby ComLink devices |
 | `CAMERA` | Scan QR codes for peer key exchange |
-
-Location permission is **not** requested. BLE scanning uses the `neverForLocation` flag.
+| `ACCESS_FINE_LOCATION` | Required for sending Location coordinates to peers |
+| `READ_MEDIA_*` | Required for picking Images, Video, Audio, and Documents to send |
 
 ---
 

@@ -1,11 +1,13 @@
 package com.aarushchaudhary.comlink.ui
 
 import android.app.Application
+import android.net.Uri
 import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aarushchaudhary.comlink.ComLinkApp
 import com.aarushchaudhary.comlink.crypto.SessionCipher
+import com.aarushchaudhary.comlink.data.FileTransferManager
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
 import com.aarushchaudhary.comlink.data.SessionStateEntity
@@ -22,6 +24,10 @@ import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 class ComLinkViewModel(application: Application) : AndroidViewModel(application) {
+
+    companion object {
+        const val SAVED_MESSAGES_ID = "__SAVED__"
+    }
 
     private val app = application as ComLinkApp
     private val dao = app.database.comLinkDao()
@@ -43,7 +49,22 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    // FileTransferManager — initialized once, uses our cipher/lock callbacks
+    val fileTransferManager: FileTransferManager by lazy {
+        FileTransferManager(
+            context = app,
+            dao = dao,
+            identityManager = identity,
+            router = router,
+            getOrCreateCipher = { peerId -> getOrCreateCipher(peerId) },
+            getPeerLock = { peerId -> getPeerLock(peerId) }
+        ).also { app.fileTransferManager = it }
+    }
+
     init {
+        // Force lazy init of fileTransferManager
+        fileTransferManager
+
         router.onMessageReceived = { envelope ->
             processIncomingEnvelope(envelope)
         }
@@ -76,6 +97,17 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
         }
+
+        // Periodic retry: every 30s, re-attempt any stuck [WAIT] messages for connected peers
+        viewModelScope.launch(Dispatchers.IO) {
+            while (isActive) {
+                kotlinx.coroutines.delay(30000)
+                val connectedPeers = dao.getConnectedPeers()
+                for (peer in connectedPeers) {
+                    resendPendingMessages(peer.deviceId)
+                }
+            }
+        }
     }
     
     private fun resendPendingMessages(peerId: String) {
@@ -89,6 +121,9 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             var currentCounter = state.myNextCounter
             
             for (msg in pending) {
+                // Skip file messages — they have their own transfer logic
+                if (msg.messageType != "TEXT") continue
+
                 var finalPayload = msg.plaintext
                 if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
                     val json = org.json.JSONObject()
@@ -117,6 +152,49 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             dao.updateMyCounter(peerId, currentCounter)
+        }
+    }
+
+    /**
+     * Manually retry sending a single stuck [WAIT] message.
+     * Re-encrypts and re-broadcasts with the current session counter so the
+     * recipient's replay-guard accepts it as a fresh message.
+     */
+    fun retryMessage(peerId: String, msg: com.aarushchaudhary.comlink.data.MessageEntity) {
+        if (!msg.isFromMe || msg.status != 0) return
+        viewModelScope.launch(Dispatchers.IO) {
+            getPeerLock(peerId).withLock {
+                val state = dao.getSessionState(peerId) ?: return@withLock
+                val cipher = getOrCreateCipher(peerId) ?: return@withLock
+
+                val counter = state.myNextCounter
+                var finalPayload = msg.plaintext
+                if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
+                    val json = org.json.JSONObject()
+                    json.put("text", msg.plaintext)
+                    msg.replyToMessageId?.let { json.put("replyId", it) }
+                    msg.replyToSenderId?.let { json.put("replySender", it) }
+                    msg.replyToTextSnippet?.let { json.put("replySnippet", it) }
+                    finalPayload = json.toString()
+                }
+
+                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
+                val nonceBytes = cipher.constructNonce(counter)
+                val envelope = Envelope(
+                    sender_id = identity.getDeviceId(),
+                    recipient_id = peerId,
+                    ciphertext = ciphertextBytes.toByteString(),
+                    nonce = nonceBytes.toByteString(),
+                    timestamp = msg.timestamp,
+                    envelope_id = msg.messageId,
+                    ttl = 10
+                )
+                dao.updateMyCounter(peerId, counter + 1)
+                val success = router.sendLocalMessage(envelope)
+                if (success) {
+                    dao.updateMessageStatus(msg.messageId, 1)
+                }
+            }
         }
     }
 
@@ -257,11 +335,128 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 replyToTextSnippet = replyToSnippet
             )
             dao.insertMessage(msgEntity)
+            dao.updatePeerLastMessageTime(peerId, msgEntity.timestamp)
             
             val success = router.sendLocalMessage(envelope)
             if (success) {
                 dao.updateMessageStatus(envId, 1)
             }
+            }
+        }
+    }
+
+    /**
+     * Send a file (image, document, audio) to a peer.
+     * Creates a placeholder message immediately and starts the multi-envelope
+     * file transfer in the background.
+     */
+    fun sendFileMessage(
+        peerId: String,
+        uri: Uri,
+        replyToId: String? = null,
+        replyToSender: String? = null,
+        replyToSnippet: String? = null
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val contentResolver = app.contentResolver
+            val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+            val fileName = getFileName(uri) ?: "file"
+            val fileSize = getFileSize(uri)
+
+            val messageType = when {
+                mimeType.startsWith("image/") -> "IMAGE"
+                mimeType.startsWith("audio/") -> "AUDIO"
+                mimeType.startsWith("video/") -> "VIDEO"
+                else -> "DOCUMENT"
+            }
+
+            val messageId = UUID.randomUUID().toString()
+
+            // Insert placeholder message immediately (shows in chat with progress bar)
+            val message = MessageEntity(
+                messageId = messageId,
+                deviceId = peerId,
+                isFromMe = true,
+                plaintext = "\u2709 $fileName",
+                timestamp = System.currentTimeMillis(),
+                replyToMessageId = replyToId,
+                replyToSenderId = replyToSender,
+                replyToTextSnippet = replyToSnippet,
+                messageType = messageType,
+                fileTransferId = messageId,
+                fileName = fileName,
+                fileMimeType = mimeType,
+                fileSize = fileSize
+            )
+            dao.insertMessage(message)
+            dao.updatePeerLastMessageTime(peerId, message.timestamp)
+
+            // Launch the multi-envelope transfer
+            fileTransferManager.sendFile(peerId, uri, messageId)
+        }
+    }
+
+    fun sendLocationMessage(
+        peerId: String,
+        lat: Double,
+        lon: Double,
+        replyToId: String? = null,
+        replyToSender: String? = null,
+        replyToSnippet: String? = null
+    ) {
+        val plaintext = "LOCATION:$lat,$lon"
+        viewModelScope.launch(Dispatchers.IO) {
+            getPeerLock(peerId).withLock {
+                val state = dao.getSessionState(peerId) ?: return@withLock
+                val cipher = getOrCreateCipher(peerId) ?: return@withLock
+                
+                val counter = state.myNextCounter
+                
+                var finalPayload = plaintext
+                if (replyToId != null || replyToSender != null || replyToSnippet != null) {
+                    val json = org.json.JSONObject()
+                    json.put("text", plaintext)
+                    replyToId?.let { json.put("replyId", it) }
+                    replyToSender?.let { json.put("replySender", it) }
+                    replyToSnippet?.let { json.put("replySnippet", it) }
+                    finalPayload = json.toString()
+                }
+                
+                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
+                val nonceBytes = cipher.constructNonce(counter)
+                
+                val envId = UUID.randomUUID().toString()
+                
+                val envelope = Envelope(
+                    sender_id = identity.getDeviceId(),
+                    recipient_id = peerId,
+                    ciphertext = ciphertextBytes.toByteString(),
+                    nonce = nonceBytes.toByteString(),
+                    timestamp = System.currentTimeMillis(),
+                    envelope_id = envId,
+                    ttl = 10
+                )
+                
+                dao.updateMyCounter(peerId, counter + 1)
+                
+                val msgEntity = MessageEntity(
+                    messageId = envId,
+                    deviceId = peerId,
+                    isFromMe = true,
+                    plaintext = "$lat,$lon",
+                    timestamp = envelope.timestamp ?: System.currentTimeMillis(),
+                    replyToMessageId = replyToId,
+                    replyToSenderId = replyToSender,
+                    replyToTextSnippet = replyToSnippet,
+                    messageType = "LOCATION"
+                )
+                dao.insertMessage(msgEntity)
+                dao.updatePeerLastMessageTime(peerId, msgEntity.timestamp)
+                
+                val success = router.sendLocalMessage(envelope)
+                if (success) {
+                    dao.updateMessageStatus(envId, 1)
+                }
             }
         }
     }
@@ -287,11 +482,33 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 }
                 
                 dao.updatePeerCounter(senderId, counter)
+
+                // Route based on content_type
+                val contentType = envelope.content_type ?: 0
+                when (contentType) {
+                    FileTransferManager.CONTENT_TYPE_FILE_HEADER -> {
+                        fileTransferManager.onFileHeaderReceived(senderId, decryptedBytes)
+                        // Send ACK for the header envelope
+                        sendAck(senderId, envelope.envelope_id ?: return@launch)
+                        return@launch
+                    }
+                    FileTransferManager.CONTENT_TYPE_FILE_PART -> {
+                        fileTransferManager.onFilePartReceived(senderId, decryptedBytes)
+                        return@launch
+                    }
+                }
                 
+                // content_type == 0 (MESSAGE): existing text/ACK/READ logic
                 val plaintextRaw = String(decryptedBytes, Charsets.UTF_8)
                 if (plaintextRaw.startsWith("ACK:")) {
                     val ackedId = plaintextRaw.substringAfter("ACK:")
                     dao.updateMessageStatus(ackedId, 2) // 2 = Delivered
+                    return@launch
+                }
+                
+                if (plaintextRaw.startsWith("READ:")) {
+                    val readId = plaintextRaw.substringAfter("READ:")
+                    dao.updateMessageStatus(readId, 3) // 3 = Seen
                     return@launch
                 }
                 
@@ -314,6 +531,13 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }
                 
+                var finalMsgType = "TEXT"
+                
+                if (actualText.startsWith("LOCATION:")) {
+                    finalMsgType = "LOCATION"
+                    actualText = actualText.substringAfter("LOCATION:")
+                }
+                
                 val msgEntity = MessageEntity(
                     messageId = envelope.envelope_id ?: UUID.randomUUID().toString(),
                     deviceId = senderId,
@@ -322,9 +546,11 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                     timestamp = envelope.timestamp ?: System.currentTimeMillis(),
                     replyToMessageId = repId,
                     replyToSenderId = repSender,
-                    replyToTextSnippet = repSnippet
+                    replyToTextSnippet = repSnippet,
+                    messageType = finalMsgType
                 )
                 dao.insertMessage(msgEntity)
+                dao.updatePeerLastMessageTime(senderId, msgEntity.timestamp)
                 
                 // Send ACK
                 sendAck(senderId, msgEntity.messageId)
@@ -359,5 +585,112 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             router.sendLocalMessage(envelope)
             }
         }
+    }
+
+    fun markAsRead(peerId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val unread = dao.getUnreadMessages(peerId)
+            if (unread.isEmpty()) return@launch
+
+            // Mark messages as read locally
+            dao.markIncomingMessagesAsRead(peerId)
+
+            // Send READ receipts for each unread message
+            getPeerLock(peerId).withLock {
+                val state = dao.getSessionState(peerId) ?: return@withLock
+                val cipher = getOrCreateCipher(peerId) ?: return@withLock
+                var counter = state.myNextCounter
+
+                for (msg in unread) {
+                    val ciphertextBytes = cipher.encrypt("READ:${msg.messageId}".toByteArray(Charsets.UTF_8), counter)
+                    val nonceBytes = cipher.constructNonce(counter)
+                    val envelope = Envelope(
+                        sender_id = identity.getDeviceId(),
+                        recipient_id = peerId,
+                        ciphertext = ciphertextBytes.toByteString(),
+                        nonce = nonceBytes.toByteString(),
+                        timestamp = System.currentTimeMillis(),
+                        envelope_id = UUID.randomUUID().toString(),
+                        ttl = 10
+                    )
+                    counter++
+                    router.sendLocalMessage(envelope)
+                }
+                dao.updateMyCounter(peerId, counter)
+            }
+        }
+    }
+
+    private suspend fun ensureSavedPeerExists() {
+        if (dao.getPeer(SAVED_MESSAGES_ID) == null) {
+            dao.insertPeer(PeerEntity(
+                deviceId = SAVED_MESSAGES_ID,
+                publicKeyBase64 = "",
+                contactName = "SAVED MESSAGES",
+                lastSeenTimestamp = 0L
+            ))
+        }
+    }
+
+    fun saveMessageToSaved(msg: MessageEntity, senderName: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            ensureSavedPeerExists()
+            val savedMsg = MessageEntity(
+                messageId = UUID.randomUUID().toString(),
+                deviceId = SAVED_MESSAGES_ID,
+                isFromMe = false,
+                plaintext = msg.plaintext,
+                timestamp = System.currentTimeMillis(),
+                replyToSenderId = senderName,
+                replyToTextSnippet = msg.plaintext.take(50),
+                status = 1
+            )
+            dao.insertMessage(savedMsg)
+            dao.updatePeerLastMessageTime(SAVED_MESSAGES_ID, savedMsg.timestamp)
+        }
+    }
+
+    fun sendSavedNote(text: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            ensureSavedPeerExists()
+            val noteMsg = MessageEntity(
+                messageId = UUID.randomUUID().toString(),
+                deviceId = SAVED_MESSAGES_ID,
+                isFromMe = true,
+                plaintext = text,
+                timestamp = System.currentTimeMillis(),
+                status = 1
+            )
+            dao.insertMessage(noteMsg)
+            dao.updatePeerLastMessageTime(SAVED_MESSAGES_ID, noteMsg.timestamp)
+        }
+    }
+
+    fun togglePin(peerId: String, isPinned: Boolean) {
+        viewModelScope.launch(Dispatchers.IO) {
+            dao.updatePeerPinned(peerId, isPinned)
+        }
+    }
+
+    // ─── File helpers ──────────────────────────────────────────────────
+
+    private fun getFileName(uri: Uri): String? {
+        app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+            if (cursor.moveToFirst() && nameIndex >= 0) {
+                return cursor.getString(nameIndex)
+            }
+        }
+        return uri.lastPathSegment
+    }
+
+    private fun getFileSize(uri: Uri): Long? {
+        app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+            if (cursor.moveToFirst() && sizeIndex >= 0) {
+                return cursor.getLong(sizeIndex)
+            }
+        }
+        return null
     }
 }

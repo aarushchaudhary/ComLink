@@ -6,6 +6,7 @@ import com.aarushchaudhary.comlink.bluetooth.BluetoothService
 import com.aarushchaudhary.comlink.bluetooth.MeshRouter
 import com.aarushchaudhary.comlink.crypto.IdentityManager
 import com.aarushchaudhary.comlink.data.ComLinkDatabase
+import com.aarushchaudhary.comlink.data.FileTransferManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -23,6 +24,10 @@ class ComLinkApp : Application() {
         
     lateinit var bluetoothService: BluetoothService
         private set
+
+    // FileTransferManager is initialized lazily from the ViewModel
+    // since it needs the cipher/lock callbacks from the ViewModel
+    lateinit var fileTransferManager: FileTransferManager
 
     private val appScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
