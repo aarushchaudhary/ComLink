@@ -45,5 +45,10 @@ class ComLinkApp : Application() {
         meshRouter = MeshRouter(identityManager.getDeviceId(), appScope)
         
         bluetoothService = BluetoothService(this, meshRouter)
+        
+        // Wire up direct send for targeted file transfers
+        meshRouter.sendDirectToNetwork = { peerId, payload, noResponse ->
+            bluetoothService.sendDirect(peerId, payload, noResponse)
+        }
     }
 }

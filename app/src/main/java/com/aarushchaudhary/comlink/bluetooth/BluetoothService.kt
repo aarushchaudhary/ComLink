@@ -69,13 +69,13 @@ class BluetoothService(
         val writeMutex = kotlinx.coroutines.sync.Mutex()
         val writeCompleted = Channel<Unit>(1)
 
-        suspend fun writeChunk(chunk: ByteArray): Boolean {
+        suspend fun writeChunk(chunk: ByteArray, noResponse: Boolean = false): Boolean {
             writeMutex.lock()
             try {
                 val characteristic = gatt.getService(SERVICE_UUID)?.getCharacteristic(CHARACTERISTIC_UUID)
                 if (characteristic != null) {
                     characteristic.value = chunk
-                    characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                    characteristic.writeType = if (noResponse) BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE else BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
                     
                     // Drain old events
                     while(writeCompleted.tryReceive().isSuccess) {}
@@ -345,7 +345,9 @@ class BluetoothService(
 
     suspend fun broadcast(payload: ByteArray): Boolean {
         val packetId = payload.contentHashCode()
-        val chunkPayloads = payload.toList().chunked(MAX_CHUNK_PAYLOAD_SIZE).map { it.toByteArray() }
+        val chunkPayloads = (0 until payload.size step MAX_CHUNK_PAYLOAD_SIZE).map { start ->
+            payload.copyOfRange(start, minOf(start + MAX_CHUNK_PAYLOAD_SIZE, payload.size))
+        }
         val totalChunks = chunkPayloads.size
 
         if (totalChunks > 255) {
@@ -398,6 +400,39 @@ class BluetoothService(
         }
         for (chunk in chunksToSend) {
             if (!connection.writeChunk(chunk)) return false
+        }
+        return true
+    }
+
+    /**
+     * Send a payload directly to a specific peer by device ID, bypassing broadcast.
+     * Uses no-response BLE writes for maximum throughput when [noResponse] is true.
+     */
+    suspend fun sendDirect(peerId: String, payload: ByteArray, noResponse: Boolean = false): Boolean {
+        // Reverse lookup: find the MAC address for this peer device ID
+        val macAddress = macToPeerId.entries.firstOrNull { it.value == peerId }?.key
+            ?: return broadcast(payload) // Fallback to broadcast if peer MAC unknown
+        val connection = activeGatts[macAddress]
+            ?: return broadcast(payload) // Fallback if connection lost
+
+        val packetId = packetCounter.getAndIncrement()
+        val chunkSize = connection.effectiveChunkSize.coerceAtMost(MAX_CHUNK_PAYLOAD_SIZE)
+        val chunkPayloads = (0 until payload.size step chunkSize).map { start ->
+            payload.copyOfRange(start, minOf(start + chunkSize, payload.size))
+        }
+        val totalChunks = chunkPayloads.size
+        if (totalChunks > 255) return false
+
+        val chunksToSend = chunkPayloads.mapIndexed { index, chunkData ->
+            val buffer = ByteBuffer.allocate(6 + chunkData.size)
+            buffer.putInt(packetId)
+            buffer.put(totalChunks.toByte())
+            buffer.put(index.toByte())
+            buffer.put(chunkData)
+            buffer.array()
+        }
+        for (chunk in chunksToSend) {
+            if (!connection.writeChunk(chunk, noResponse)) return false
         }
         return true
     }

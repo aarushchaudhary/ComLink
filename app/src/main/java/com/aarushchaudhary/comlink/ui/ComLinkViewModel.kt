@@ -161,7 +161,12 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
      * recipient's replay-guard accepts it as a fresh message.
      */
     fun retryMessage(peerId: String, msg: com.aarushchaudhary.comlink.data.MessageEntity) {
-        if (!msg.isFromMe || msg.status != 0) return
+        if (!msg.isFromMe) return
+        // Allow retry for stuck text (status 0) or stuck file transfers (progress < 1)
+        val isStuckFile = msg.fileTransferId != null && msg.transferProgress < 1f
+        val isStuckText = msg.status == 0 && msg.fileTransferId == null
+        if (!isStuckFile && !isStuckText) return
+        
         viewModelScope.launch(Dispatchers.IO) {
             
             // 1. Jumpstart / Resume File Transfers
@@ -169,18 +174,17 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 val file = java.io.File(msg.filePath)
                 if (!file.exists()) return@launch
                 
-                val fileBytes = file.readBytes()
-                val partCount = kotlin.math.ceil(fileBytes.size.toDouble() / com.aarushchaudhary.comlink.data.FileTransferManager.PART_SIZE).toInt()
+                // Get accurate resume point from DB
+                val transfer = dao.getFileTransfer(msg.fileTransferId)
+                val partCount = transfer?.partCount 
+                    ?: kotlin.math.ceil(file.length().toDouble() / com.aarushchaudhary.comlink.data.FileTransferManager.PART_SIZE).toInt()
+                val startPart = transfer?.lastSentPartIndex ?: 0
                 
-                // Calculate where it stopped based on current progress
-                val startPart = (msg.transferProgress * partCount).toInt().coerceIn(0, partCount - 1)
-                
-                // Pass to FileTransferManager to blindly resend remaining parts
                 fileTransferManager.resumeOutgoingTransfer(
                     transferId = msg.fileTransferId,
                     peerId = peerId,
                     messageId = msg.messageId,
-                    fileBytes = fileBytes,
+                    filePath = msg.filePath,
                     partCount = partCount,
                     startPart = startPart
                 )

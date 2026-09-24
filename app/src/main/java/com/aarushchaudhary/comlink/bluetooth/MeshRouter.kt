@@ -15,6 +15,9 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
     // Callback to physically broadcast an envelope to all active Bluetooth connections
     var broadcastToNetwork: (suspend (ByteArray) -> Boolean)? = null
 
+    // Callback to send directly to a specific peer (bypasses broadcast for file transfers)
+    var sendDirectToNetwork: (suspend (peerId: String, ByteArray, noResponse: Boolean) -> Boolean)? = null
+
     // LRU Cache to prevent broadcast storms (Max 10,000 envelope IDs)
     private val seenEnvelopes = Collections.synchronizedMap(
         object : LinkedHashMap<String, Boolean>(1000, 0.75f, true) {
@@ -71,5 +74,17 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
         // Record it so we don't rebroadcast it if it echoes back
         seenEnvelopes[envelope.envelope_id] = true
         return broadcastToNetwork?.invoke(envelope.encode()) ?: false
+    }
+
+    /**
+     * Send an envelope directly to a specific peer. Uses targeted BLE connection
+     * instead of broadcasting. Falls back to broadcast if direct send unavailable.
+     */
+    suspend fun sendDirectMessage(peerId: String, envelope: Envelope, noResponse: Boolean = false): Boolean {
+        seenEnvelopes[envelope.envelope_id] = true
+        val encoded = envelope.encode()
+        return sendDirectToNetwork?.invoke(peerId, encoded, noResponse) 
+            ?: broadcastToNetwork?.invoke(encoded) 
+            ?: false
     }
 }

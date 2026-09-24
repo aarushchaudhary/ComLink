@@ -37,6 +37,7 @@ data class FileTransferEntity(
     val partCount: Int,
     @ColumnInfo(defaultValue = "0") val receivedParts: Int = 0,
     val isOutgoing: Boolean,
+    @ColumnInfo(defaultValue = "0") val lastSentPartIndex: Int = 0,
     @ColumnInfo(defaultValue = "IN_PROGRESS") val status: String = "IN_PROGRESS",
     val createdAt: Long = System.currentTimeMillis()
 )
@@ -150,6 +151,9 @@ interface ComLinkDao {
     @Query("UPDATE file_transfers SET status = :status WHERE transferId = :transferId")
     suspend fun updateTransferStatus(transferId: String, status: String)
 
+    @Query("UPDATE file_transfers SET lastSentPartIndex = :partIndex WHERE transferId = :transferId")
+    suspend fun updateLastSentPartIndex(transferId: String, partIndex: Int)
+
     @Query("UPDATE messages SET filePath = :path, transferProgress = 1.0, status = :status WHERE messageId = :messageId")
     suspend fun completeFileMessage(messageId: String, path: String, status: Int)
 
@@ -162,13 +166,14 @@ interface ComLinkDao {
 
 @Database(
     entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class, FileTransferEntity::class], 
-    version = 6, 
+    version = 7, 
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3),
         AutoMigration(from = 3, to = 4),
         AutoMigration(from = 4, to = 5),
-        AutoMigration(from = 5, to = 6)
+        AutoMigration(from = 5, to = 6),
+        AutoMigration(from = 6, to = 7)
     ]
 )
 abstract class ComLinkDatabase : RoomDatabase() {
