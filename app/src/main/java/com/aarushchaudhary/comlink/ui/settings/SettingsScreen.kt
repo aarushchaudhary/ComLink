@@ -105,7 +105,7 @@ fun SettingsScreen(context: Context, onBack: () -> Unit) {
                 Spacer(Modifier.height(8.dp))
                 
                 Text("> WEBSITE", color = accentColor, fontFamily = FontFamily.Monospace, modifier = Modifier.clickable {
-                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://aarushchaudhary.vercel.app/")))
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://aarushchaudhary.tech/")))
                 })
                 Spacer(Modifier.height(8.dp))
                 

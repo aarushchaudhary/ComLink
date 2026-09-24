@@ -166,6 +166,52 @@ class FileTransferManager(
     }
 
     /**
+     * Jumpstarts / resumes a stopped or stuck outgoing file transfer.
+     */
+    suspend fun resumeOutgoingTransfer(
+        transferId: String,
+        peerId: String,
+        messageId: String,
+        fileBytes: ByteArray,
+        partCount: Int,
+        startPart: Int
+    ) {
+        Log.i(TAG, "Jumpstarting transfer $transferId from part $startPart")
+        dao.updateTransferStatus(transferId, "IN_PROGRESS")
+        
+        for (i in startPart until partCount) {
+            val start = i * PART_SIZE
+            val end = minOf(start + PART_SIZE, fileBytes.size)
+            val partData = fileBytes.copyOfRange(start, end)
+
+            val part = FilePart(
+                transfer_id = transferId,
+                part_index = i,
+                data_ = okio.ByteString.of(*partData)
+            )
+
+            val partSent = sendEncryptedPayload(
+                peerId, part.encode(), CONTENT_TYPE_FILE_PART
+            )
+
+            if (!partSent) {
+                Log.e(TAG, "Jumpstart failed to send FILE_PART $i/$partCount for transfer $transferId")
+                dao.updateTransferStatus(transferId, "FAILED")
+                return
+            }
+
+            // Update progress in the message
+            val progress = (i + 1).toFloat() / partCount
+            dao.updateTransferProgress(messageId, progress)
+
+            delay(50)
+        }
+
+        dao.updateTransferStatus(transferId, "COMPLETE")
+        dao.updateMessageStatus(messageId, 1) // SENT
+    }
+
+    /**
      * Handle an incoming FILE_HEADER. Creates a placeholder message and
      * prepares the temp directory for receiving parts.
      */
@@ -254,9 +300,12 @@ class FileTransferManager(
         partFile.parentFile?.mkdirs()
         val partBytes = part.data_.toByteArray()
         if (partBytes.isEmpty()) return
+        val alreadyExisted = partFile.exists()
         partFile.writeBytes(partBytes)
 
-        dao.incrementReceivedParts(transferId)
+        if (!alreadyExisted) {
+            dao.incrementReceivedParts(transferId)
+        }
 
         // Re-query to get updated count
         val updatedTransfer = dao.getFileTransfer(transferId) ?: return

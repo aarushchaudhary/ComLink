@@ -163,15 +163,46 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     fun retryMessage(peerId: String, msg: com.aarushchaudhary.comlink.data.MessageEntity) {
         if (!msg.isFromMe || msg.status != 0) return
         viewModelScope.launch(Dispatchers.IO) {
+            
+            // 1. Jumpstart / Resume File Transfers
+            if (msg.fileTransferId != null && msg.filePath != null) {
+                val file = java.io.File(msg.filePath)
+                if (!file.exists()) return@launch
+                
+                val fileBytes = file.readBytes()
+                val partCount = kotlin.math.ceil(fileBytes.size.toDouble() / com.aarushchaudhary.comlink.data.FileTransferManager.PART_SIZE).toInt()
+                
+                // Calculate where it stopped based on current progress
+                val startPart = (msg.transferProgress * partCount).toInt().coerceIn(0, partCount - 1)
+                
+                // Pass to FileTransferManager to blindly resend remaining parts
+                fileTransferManager.resumeOutgoingTransfer(
+                    transferId = msg.fileTransferId,
+                    peerId = peerId,
+                    messageId = msg.messageId,
+                    fileBytes = fileBytes,
+                    partCount = partCount,
+                    startPart = startPart
+                )
+                return@launch
+            }
+
+            // 2. Retry standard text / location messages
             getPeerLock(peerId).withLock {
                 val state = dao.getSessionState(peerId) ?: return@withLock
                 val cipher = getOrCreateCipher(peerId) ?: return@withLock
 
                 val counter = state.myNextCounter
-                var finalPayload = msg.plaintext
+                
+                var basePlaintext = msg.plaintext
+                if (msg.messageType == "LOCATION") {
+                    basePlaintext = "LOCATION:${msg.plaintext}"
+                }
+                
+                var finalPayload = basePlaintext
                 if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
                     val json = org.json.JSONObject()
-                    json.put("text", msg.plaintext)
+                    json.put("text", basePlaintext)
                     msg.replyToMessageId?.let { json.put("replyId", it) }
                     msg.replyToSenderId?.let { json.put("replySender", it) }
                     msg.replyToTextSnippet?.let { json.put("replySnippet", it) }

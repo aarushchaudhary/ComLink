@@ -151,6 +151,8 @@ fun ConversationScreen(
                 )
                 replyingTo = null
             }
+        } else {
+            android.widget.Toast.makeText(context, "Location permission denied", android.widget.Toast.LENGTH_SHORT).show()
         }
         showAttachmentPicker = false
     }
@@ -228,7 +230,9 @@ fun ConversationScreen(
                                 }
                             }
                             
-                            val tickStr = if (msg.isFromMe) {
+                            val tickStr = if (msg.isFromMe && msg.fileTransferId != null && msg.transferProgress < 1f) {
+                                " [UP: ${(msg.transferProgress * 100).toInt()}%]"
+                            } else if (msg.isFromMe) {
                                 when (msg.status) {
                                     0 -> " [WAIT]"
                                     1 -> " [SENT]"
@@ -240,7 +244,7 @@ fun ConversationScreen(
                             Text(
                                 text = formatTimestamp(msg.timestamp) + tickStr, 
                                 fontSize = 10.sp, 
-                                color = Color.Gray,
+                                color = if (tickStr.startsWith(" [UP")) Color(0xFF03A9F4) else Color.Gray,
                                 fontFamily = FontFamily.Monospace,
                                 modifier = Modifier.align(Alignment.End).padding(top = 4.dp)
                             )
@@ -342,10 +346,14 @@ fun ConversationScreen(
                     },
                     colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
-                // Show RETRY only for our own messages still stuck in [WAIT]
-                if (!isSavedMessages && showContextMenuFor!!.isFromMe && showContextMenuFor!!.status == 0) {
+                val isStuckFile = showContextMenuFor!!.isFromMe && showContextMenuFor!!.fileTransferId != null && showContextMenuFor!!.transferProgress < 1f
+                val isStuckWait = showContextMenuFor!!.isFromMe && showContextMenuFor!!.status == 0
+                if (!isSavedMessages && (isStuckWait || isStuckFile)) {
+                    val isFile = showContextMenuFor!!.fileTransferId != null
+                    val label = if (isFile) "> JUMPSTART TRANSFER" else "> RETRY SEND"
+                    val color = if (isFile) Color(0xFF03A9F4) else Color(0xFFFF9800)
                     ListItem(
-                        headlineContent = { Text("> RETRY SEND", color = Color(0xFFFF9800), fontFamily = FontFamily.Monospace) },
+                        headlineContent = { Text(label, color = color, fontFamily = FontFamily.Monospace) },
                         modifier = Modifier.clickable {
                             viewModel.retryMessage(peerId, showContextMenuFor!!)
                             showContextMenuFor = null
@@ -793,32 +801,61 @@ private fun LocationMessageContent(msg: MessageEntity, accentColor: Color) {
 private fun fetchLocation(context: android.content.Context, onLocation: (lat: Double, lon: Double) -> Unit) {
     try {
         val locationManager = context.getSystemService(android.content.Context.LOCATION_SERVICE) as android.location.LocationManager
-        val provider = if (locationManager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
-            android.location.LocationManager.GPS_PROVIDER
-        } else if (locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
-            android.location.LocationManager.NETWORK_PROVIDER
-        } else {
+        
+        if (!locationManager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) && 
+            !locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
+            android.widget.Toast.makeText(context, "Please enable Location Services (GPS)", android.widget.Toast.LENGTH_LONG).show()
             return
         }
 
-        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED ||
-            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            
-            val location = locationManager.getLastKnownLocation(provider)
-            if (location != null) {
-                onLocation(location.latitude, location.longitude)
-            } else {
-                locationManager.requestSingleUpdate(provider, object : android.location.LocationListener {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED &&
+            androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_COARSE_LOCATION) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            android.widget.Toast.makeText(context, "Location permission missing", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        android.widget.Toast.makeText(context, "Acquiring location...", android.widget.Toast.LENGTH_SHORT).show()
+
+        val provider = if (locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
+            android.location.LocationManager.NETWORK_PROVIDER
+        } else {
+            android.location.LocationManager.GPS_PROVIDER
+        }
+
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            locationManager.getCurrentLocation(
+                provider,
+                null,
+                androidx.core.content.ContextCompat.getMainExecutor(context)
+            ) { location ->
+                if (location != null) {
+                    onLocation(location.latitude, location.longitude)
+                } else {
+                    val lastKnown = locationManager.getLastKnownLocation(provider)
+                    if (lastKnown != null) {
+                        onLocation(lastKnown.latitude, lastKnown.longitude)
+                    } else {
+                        android.widget.Toast.makeText(context, "Could not determine location", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            locationManager.requestSingleUpdate(
+                provider,
+                object : android.location.LocationListener {
                     override fun onLocationChanged(loc: android.location.Location) {
                         onLocation(loc.latitude, loc.longitude)
                     }
                     override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
                     override fun onProviderEnabled(provider: String) {}
                     override fun onProviderDisabled(provider: String) {}
-                }, android.os.Looper.getMainLooper())
-            }
+                },
+                android.os.Looper.getMainLooper()
+            )
         }
     } catch (e: Exception) {
         e.printStackTrace()
+        android.widget.Toast.makeText(context, "Error fetching location", android.widget.Toast.LENGTH_SHORT).show()
     }
 }
