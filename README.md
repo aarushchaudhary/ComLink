@@ -31,7 +31,7 @@ graph TD
     style C fill:#2196F3,stroke:#1976D2,stroke-width:2px,color:#fff
 ```
 
-*When Node A sends a message to Node C, Node B receives it, checks the `recipient_id`, sees it is not the intended target, decrements the TTL (Time-To-Live), and broadcasts it forward.*
+*When Node A sends a message to Node C, Node B receives it, checks its rotating `tag` against its own contacts, finds no match, decrements the TTL (Time-To-Live), and broadcasts it forward. Envelopes name neither sender nor recipient.*
 
 ### The Protocol Stack
 ComLink relies on a custom multi-layered networking stack:
@@ -53,12 +53,13 @@ ComLink relies on a custom multi-layered networking stack:
 ### Messages
 * Both phones derive the same session key from their two keys (X25519 + HKDF-SHA256). Every message is encrypted with **AES-256-GCM**, using a 96-bit nonce built from a session salt, a direction byte and a counter.
 * All encryption goes through one locked send path (`EncryptedSender`), so a counter, and with it a nonce, is never used twice. Sending stops before the 24-bit counter could wrap.
-* The envelope header (sender, recipient, envelope ID, content type, timestamp) is bound to the ciphertext as **AAD**: a relay that changes any of it breaks decryption. Only the hop count (`ttl`) is left out, because relays must lower it.
+* Envelopes carry no sender or recipient ID. Instead each one has a 16-byte **rotating tag**: HMAC-SHA256 of a key only the two contacts share, the direction and the 15-minute window. Only the recipient can match it, so it is also how the recipient knows who sent it. Tags for the previous, current and next window are accepted, so clocks may be up to 15 minutes apart.
+* The envelope header (tag, envelope ID, content type, timestamp) is bound to the ciphertext as **AAD**: a relay that changes any of it breaks decryption. Only the hop count (`ttl`) is left out, because relays must lower it.
 * Every message is padded to one of 7 fixed sizes (256 B to 100 KiB) before encryption, so relays can't tell a text from a read receipt by its size.
 * A **sliding replay window** (256 counters) accepts messages that arrive out of order through the mesh, and rejects anything already seen.
 
 ### Presence
-* A plain `HELLO`/`PING` only says "someone nearby claims to be X". A contact is shown **online**, and gets direct sends, only after their **encrypted PRESENCE** decrypts. So a fake HELLO can't show someone as online or redirect their messages.
+* `HELLO`/`PING` name nobody: they only say "a ComLink phone is here". A new neighbour gets an encrypted **PRESENCE** for each contact (at most once a minute), and only the right contact can read theirs. A contact is shown **online**, and gets direct sends, only after their PRESENCE decrypts, so nobody can fake someone being online or redirect their messages.
 
 ### Files
 * Incoming file headers and parts are checked before anything touches disk: canonical UUIDs only (no `../`), sizes and part counts within limits, and parts only from the contact who sent the header.
@@ -69,11 +70,10 @@ ComLink relies on a custom multi-layered networking stack:
 * Every stored file (received files, sent copies, thumbnails, partial transfers) is encrypted with **Tink streaming AEAD** (AES-256-GCM-HKDF). Opening a document in another app uses a temporary decrypted copy that is deleted on the next app start.
 
 ### What relays and nearby listeners can still see
-* **Sender and recipient device IDs** (fixed per phone), the timestamp, the content type and the padded size of each envelope.
-* The fixed device ID in `HELLO`/`PING` broadcasts, which lets someone with a Bluetooth scanner recognise a phone.
-* There is **no forward secrecy** yet: someone who records traffic and later steals a private key can decrypt it.
-
-These are planned as future work (rotating Bluetooth IDs, then a Double Ratchet).
+* Envelopes between the same two contacts in the same 15-minute window share a tag, so they can be grouped for that window (not across windows, and not with the replies).
+* The timestamp, the content type and the padded size of each envelope.
+* Roughly how many contacts a phone has: a new neighbour receives one PRESENCE per contact.
+* There is **no forward secrecy** yet: someone who records traffic and later steals a private key can decrypt it. This is planned as future work (a Double Ratchet).
 
 ```mermaid
 sequenceDiagram

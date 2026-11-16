@@ -74,7 +74,7 @@ class ComLinkApp : Application() {
         // Decrypted copies only live until the next start
         shareCacheDir.deleteRecursively()
 
-        meshRouter = MeshRouter(identityManager.getDeviceId(), appScope)
+        meshRouter = MeshRouter(appScope)
 
         bluetoothService = BluetoothService(this, meshRouter)
 

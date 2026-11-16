@@ -19,14 +19,15 @@ import kotlin.random.Random
  * dependencies and can be unit-tested.
  */
 class EncryptedSender(
-    private val localDeviceId: String,
     /** The next unused counter for this contact, or null when there's no session. */
     private val loadCounter: suspend (peerId: String) -> Int?,
     /** Persists the next unused counter for this contact. */
     private val saveCounter: suspend (peerId: String, nextCounter: Int) -> Unit,
     private val cipherFor: suspend (peerId: String) -> SessionCipher?,
-    /** Hands the envelope to the mesh; [direct] targets the peer's own connection. */
-    private val transmit: suspend (envelope: Envelope, direct: Boolean, noResponse: Boolean) -> Boolean
+    /** Hands the envelope for [peerId] to the mesh; [direct] targets the peer's own connection. */
+    private val transmit: suspend (peerId: String, envelope: Envelope, direct: Boolean, noResponse: Boolean) -> Boolean,
+    /** Picks the tag window; the send time, not the envelope timestamp (a retry keeps the old one). */
+    private val clock: () -> Long = System::currentTimeMillis
 ) {
     companion object {
         /** Hops a new envelope may make at most (relays also cap at this, see MeshRouter). */
@@ -69,7 +70,7 @@ class EncryptedSender(
         val cipher = cipherFor(peerId) ?: return@withLock false
         saveCounter(peerId, counter + 1)
         // Sent while holding the lock, so envelopes leave in counter order
-        transmit(seal(peerId, cipher, plaintext, counter, contentType, envelopeId, timestamp, ttl), direct, noResponse)
+        transmit(peerId, seal(cipher, plaintext, counter, contentType, envelopeId, timestamp, ttl), direct, noResponse)
     }
 
     /**
@@ -93,12 +94,11 @@ class EncryptedSender(
         noResponse: Boolean = true
     ): Boolean {
         val cipher = cipherFor(peerId) ?: return false
-        val envelope = seal(peerId, cipher, plaintext, counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis(), randomStartTtl())
-        return transmit(envelope, direct, noResponse)
+        val envelope = seal(cipher, plaintext, counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis(), randomStartTtl())
+        return transmit(peerId, envelope, direct, noResponse)
     }
 
     private fun seal(
-        peerId: String,
         cipher: SessionCipher,
         plaintext: ByteArray,
         counter: Int,
@@ -107,12 +107,13 @@ class EncryptedSender(
         timestamp: Long,
         ttl: Int
     ): Envelope {
+        // No sender or recipient ID on the wire: only this tag, which only the recipient can match
+        val tag = cipher.outgoingTag(SessionCipher.tagWindow(clock()))
         // Header fields are bound to the ciphertext: a relay that changes any of them breaks decryption
-        val aad = SessionCipher.envelopeAad(localDeviceId, peerId, envelopeId, contentType, timestamp)
+        val aad = SessionCipher.envelopeAad(tag, envelopeId, contentType, timestamp)
         // Padded to a size bucket first, so relays can't tell messages apart by length
         return Envelope(
-            sender_id = localDeviceId,
-            recipient_id = peerId,
+            tag = tag.toByteString(),
             ciphertext = cipher.encrypt(Padding.pad(plaintext), counter, aad).toByteString(),
             nonce = cipher.constructNonce(counter).toByteString(),
             timestamp = timestamp,

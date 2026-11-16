@@ -19,14 +19,17 @@ class BluetoothService(
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
 ) {
     /**
-     * A neighbour *claims* to be this contact (plain-text HELLO/PING, or a working heartbeat).
-     * Untrusted: anyone can send a HELLO. It only prompts a PRESENCE exchange; a contact is shown
+     * Some phone running ComLink is connected at this address (HELLO, PING or a working heartbeat).
+     * HELLO and PING name nobody, so this only prompts a PRESENCE exchange; a contact is shown
      * online, and gets direct sends, only after their encrypted PRESENCE decrypts (see [trustAddress]).
      */
-    var onPeerSeen: ((String) -> Unit)? = null
+    var onNeighbourSeen: ((address: String) -> Unit)? = null
     var onPeerDisconnected: ((String) -> Unit)? = null
-    // Claimed (HELLO/PING) and proven (PRESENCE) addresses per contact
+    // Addresses proven by a contact's PRESENCE
     private val addresses = PeerAddressBook()
+
+    /** The contacts proven to be at [address]. */
+    fun peersAt(address: String): List<String> = addresses.peersAt(address)
 
     /** Called once a PRESENCE from [peerId] decrypted on a write from [address]. */
     fun trustAddress(peerId: String, address: String) {
@@ -41,6 +44,9 @@ class BluetoothService(
         // Upper bound on data bytes per piece. The real size per connection is
         // (negotiated MTU - 3 GATT overhead - 6 piece header), capped at this value.
         private const val MAX_CHUNK_PAYLOAD_SIZE = 500
+
+        private val HELLO = "HELLO".toByteArray(Charsets.UTF_8)
+        private val PING = "PING".toByteArray(Charsets.UTF_8)
     }
 
     private val leAdvertiser by lazy { bluetoothAdapter?.bluetoothLeAdvertiser }
@@ -183,8 +189,7 @@ class BluetoothService(
                 Log.d(TAG, "Disconnected from: $address")
                 val current = connectionFor(address, gatt)
                 if (current != null && activeGatts.remove(address, current)) {
-                    addresses.forgetTrust(address)
-                    addresses.claimedPeerAt(address)?.let { onPeerDisconnected?.invoke(it) }
+                    addresses.forgetTrust(address).forEach { onPeerDisconnected?.invoke(it) }
                 }
                 gatt.close()
             }
@@ -197,8 +202,8 @@ class BluetoothService(
                 conn.negotiatedMtu = mtu
                 // Send HELLO only to this peer, now that MTU is negotiated
                 serviceScope.launch {
-                    val helloPayload = ("HELLO:" + meshRouter.localDeviceId).toByteArray()
-                    sendToSinglePeer(conn, helloPayload)
+                    // No device ID: anyone nearby could read it and follow this phone around
+                    sendToSinglePeer(conn, HELLO)
                 }
             }
         }
@@ -314,18 +319,16 @@ class BluetoothService(
         serviceScope.launch {
             activeGatts.keys.toList().forEach { address ->
                 val conn = activeGatts[address] ?: return@forEach
-                val pingPayload = ("PING:" + meshRouter.localDeviceId).toByteArray()
                 // Framed like HELLO, so the receiver can read it
-                val success = sendToSinglePeer(conn, pingPayload)
+                val success = sendToSinglePeer(conn, PING)
                 if (!success) {
                     Log.d(TAG, "Heartbeat failed for $address")
                     conn.gatt.disconnect()
                     if (activeGatts.remove(address, conn)) {
-                        addresses.forgetTrust(address)
-                        addresses.claimedPeerAt(address)?.let { onPeerDisconnected?.invoke(it) }
+                        addresses.forgetTrust(address).forEach { onPeerDisconnected?.invoke(it) }
                     }
                 } else {
-                    addresses.claimedPeerAt(address)?.let { onPeerSeen?.invoke(it) }
+                    onNeighbourSeen?.invoke(address)
                 }
             }
         }
@@ -347,17 +350,9 @@ class BluetoothService(
     private fun handleIncomingChunk(device: BluetoothDevice, chunk: ByteArray) {
         val completePayload = assembler.accept(device.address, chunk) ?: return
 
-        val payloadStr = String(completePayload)
-        if (payloadStr.startsWith("HELLO:")) {
-            val peerId = payloadStr.substringAfter("HELLO:")
-            addresses.claim(device.address, peerId)
-            onPeerSeen?.invoke(peerId)
-            return
-        }
-        if (payloadStr.startsWith("PING:")) {
-            val peerId = payloadStr.substringAfter("PING:")
-            addresses.claim(device.address, peerId)
-            onPeerSeen?.invoke(peerId)
+        // HELLO / PING (an envelope never starts with these bytes: its first byte is a protobuf field tag)
+        if (completePayload.contentEquals(HELLO) || completePayload.contentEquals(PING)) {
+            onNeighbourSeen?.invoke(device.address)
             return
         }
 
@@ -385,7 +380,7 @@ class BluetoothService(
     /**
      * Send a payload directly to a specific peer by device ID, bypassing broadcast.
      * Uses no-response BLE writes for maximum throughput when [noResponse] is true.
-     * Only an address proven by that peer's PRESENCE is used, so a fake HELLO can't redirect
+     * Only an address proven by that peer's PRESENCE is used, so a stranger can't redirect
      * someone's messages; until then this falls back to broadcast.
      */
     suspend fun sendDirect(peerId: String, payload: ByteArray, noResponse: Boolean = false): Boolean {

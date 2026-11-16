@@ -12,7 +12,8 @@ sealed interface IncomingMessage {
     object Presence : IncomingMessage
     class FileStatus(val payload: ByteArray) : IncomingMessage
     data class Ack(val messageId: String) : IncomingMessage
-    data class Read(val messageId: String) : IncomingMessage
+    /** One or more of our messages were read (one receipt covers a batch: "READ:id1,id2,..."). */
+    data class Read(val messageIds: List<String>) : IncomingMessage
 
     /** A chat bubble: plain text, or a location ("lat,lon"), optionally a reply. */
     data class Chat(
@@ -43,7 +44,9 @@ sealed interface IncomingMessage {
         /** The inverse of [buildReplyPayload] plus the ACK/READ/LOCATION prefixes. */
         private fun classifyMessage(raw: String): IncomingMessage {
             if (raw.startsWith(ACK_PREFIX)) return Ack(raw.substringAfter(ACK_PREFIX))
-            if (raw.startsWith(READ_PREFIX)) return Read(raw.substringAfter(READ_PREFIX))
+            if (raw.startsWith(READ_PREFIX)) {
+                return Read(raw.substringAfter(READ_PREFIX).split(',').filter { it.isNotEmpty() })
+            }
 
             var text = raw
             var replyId: String? = null

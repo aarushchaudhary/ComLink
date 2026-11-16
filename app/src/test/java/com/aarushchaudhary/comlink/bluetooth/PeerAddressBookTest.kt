@@ -2,40 +2,40 @@ package com.aarushchaudhary.comlink.bluetooth
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PeerAddressBookTest {
 
     @Test
-    fun aHelloAloneNeverEnablesDirectSends() {
+    fun unknownUntilPresenceProvesTheAddress() {
         val book = PeerAddressBook()
-        // An attacker's phone says "I'm bob" in plain text
-        book.claim("AA:AA:AA:AA:AA:AA", "bob")
-        assertEquals("bob", book.claimedPeerAt("AA:AA:AA:AA:AA:AA"))
-        // ...but direct sends to bob still have no address, so they go by broadcast
         assertNull(book.trustedAddressOf("bob"))
+        assertTrue(book.peersAt("BB").isEmpty())
+        book.trust("bob", "BB") // bob's real PRESENCE decrypted on a write from BB
+        assertEquals("BB", book.trustedAddressOf("bob"))
+        assertEquals(listOf("bob"), book.peersAt("BB"))
     }
 
     @Test
-    fun presenceProvesTheAddress() {
-        val book = PeerAddressBook()
-        book.claim("AA:AA:AA:AA:AA:AA", "bob")          // fake claim
-        book.trust("bob", "BB:BB:BB:BB:BB:BB")          // bob's real PRESENCE decrypted here
-        assertEquals("BB:BB:BB:BB:BB:BB", book.trustedAddressOf("bob"))
-        // A later fake HELLO doesn't move it
-        book.claim("AA:AA:AA:AA:AA:AA", "bob")
-        assertEquals("BB:BB:BB:BB:BB:BB", book.trustedAddressOf("bob"))
-    }
-
-    @Test
-    fun disconnectDropsTrustForThatAddressOnly() {
+    fun disconnectDropsTrustForThatAddressOnlyAndSaysWhoLeft() {
         val book = PeerAddressBook()
         book.trust("bob", "BB")
         book.trust("carol", "CC")
-        book.forgetTrust("BB")
+        assertEquals(listOf("bob"), book.forgetTrust("BB"))
         assertNull(book.trustedAddressOf("bob"))
         assertEquals("CC", book.trustedAddressOf("carol"))
+        assertTrue(book.forgetTrust("BB").isEmpty())
         book.clearTrust()
         assertNull(book.trustedAddressOf("carol"))
+    }
+
+    @Test
+    fun aContactThatMovedIsNotForgottenByTheOldAddress() {
+        val book = PeerAddressBook()
+        book.trust("bob", "BB")
+        book.trust("bob", "B2") // bob's phone now reached through a new address
+        assertTrue(book.forgetTrust("BB").isEmpty())
+        assertEquals("B2", book.trustedAddressOf("bob"))
     }
 }

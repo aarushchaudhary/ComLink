@@ -4,6 +4,7 @@ import com.google.crypto.tink.subtle.Hkdf
 import com.google.crypto.tink.subtle.X25519
 import java.nio.ByteBuffer
 import javax.crypto.Cipher
+import javax.crypto.Mac
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
@@ -15,6 +16,8 @@ class SessionCipher(
 
     private val sessionKey: ByteArray
     private val sessionSalt: ByteArray
+    // Separate key for the rotating tags, so a tag reveals nothing about the encryption key
+    private val tagKey: ByteArray
     private val myDirectionByte: Byte
     private val peerDirectionByte: Byte
 
@@ -34,6 +37,7 @@ class SessionCipher(
         
         sessionKey = keyMaterial.copyOfRange(0, 32)
         sessionSalt = keyMaterial.copyOfRange(32, 40)
+        tagKey = Hkdf.computeHkdf("HMACSHA256", sharedSecret, null, "ComLinkTag".toByteArray(Charsets.UTF_8), 32)
         
         // 3. Direction Byte Assignment to prevent Nonce Reuse
         // To guarantee nonces never collide, we assign direction bytes based on lexicographical order of public keys.
@@ -48,27 +52,35 @@ class SessionCipher(
     }
 
     companion object {
+        /** Tags change every 15 minutes. */
+        const val TAG_WINDOW_MS = 15 * 60_000L
+        const val TAG_SIZE = 16
+
+        /** The tag window a moment in time falls in. */
+        fun tagWindow(timeMs: Long): Long = Math.floorDiv(timeMs, TAG_WINDOW_MS)
+
         /**
          * The envelope header fields bound to the ciphertext as AES-GCM AAD (additional authenticated
          * data): changing any of them makes decryption fail. `ttl` is left out because relays change it.
-         * Each string is length-prefixed, so field boundaries can't be shifted.
+         * Each variable-length field is length-prefixed, so field boundaries can't be shifted.
          */
         fun envelopeAad(
-            senderId: String,
-            recipientId: String,
+            tag: ByteArray,
             envelopeId: String,
             contentType: Int,
             timestamp: Long
         ): ByteArray {
-            val fields = listOf(senderId, recipientId, envelopeId).map { it.toByteArray(Charsets.UTF_8) }
-            val buffer = ByteBuffer.allocate(AAD_LABEL.size + fields.sumOf { 4 + it.size } + 4 + 8)
+            val id = envelopeId.toByteArray(Charsets.UTF_8)
+            val buffer = ByteBuffer.allocate(AAD_LABEL.size + 4 + tag.size + 4 + id.size + 4 + 8)
             buffer.put(AAD_LABEL)
-            fields.forEach { buffer.putInt(it.size).put(it) }
+            buffer.putInt(tag.size).put(tag)
+            buffer.putInt(id.size).put(id)
             buffer.putInt(contentType).putLong(timestamp)
             return buffer.array()
         }
 
-        private val AAD_LABEL = "ComLink-envelope-v1".toByteArray(Charsets.UTF_8)
+        private val AAD_LABEL = "ComLink-envelope-v2".toByteArray(Charsets.UTF_8)
+        private val TAG_LABEL = "tag".toByteArray(Charsets.UTF_8)
 
         /**
          * Compares byte arrays as unsigned bytes, then by length. Both phones use it to order their
@@ -82,6 +94,23 @@ class SessionCipher(
             }
             return a.size.compareTo(b.size)
         }
+    }
+
+    /** The tag on envelopes we send to this contact during [window]. */
+    fun outgoingTag(window: Long): ByteArray = tag(myDirectionByte, window)
+
+    /** The tag on envelopes this contact sends us during [window]. */
+    fun incomingTag(window: Long): ByteArray = tag(peerDirectionByte, window)
+
+    // HMAC-SHA256(tag key, "tag" + direction + window), cut to 16 bytes. The direction byte makes
+    // the two directions of one chat look unrelated.
+    private fun tag(direction: Byte, window: Long): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(tagKey, "HmacSHA256"))
+        mac.update(TAG_LABEL)
+        mac.update(direction)
+        mac.update(ByteBuffer.allocate(8).putLong(window).array())
+        return mac.doFinal().copyOf(TAG_SIZE)
     }
 
     /**

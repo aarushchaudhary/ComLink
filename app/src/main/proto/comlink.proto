@@ -3,8 +3,9 @@ syntax = "proto3";
 package com.aarushchaudhary.comlink.proto;
 
 message Envelope {
-  string sender_id = 1;
-  string recipient_id = 2;
+  // 1 and 2 were sender_id / recipient_id in plain text. Gone: relays now see only the tag.
+  reserved 1, 2;
+  reserved "sender_id", "recipient_id";
   bytes ciphertext = 3;
   bytes nonce = 4;
   int64 timestamp = 5;
@@ -17,6 +18,9 @@ message Envelope {
   // 3 = PRESENCE (encrypted "I'm here", ttl 1; the only thing that marks a contact online)
   // 4 = FILE_STATUS (which parts of a transfer the receiver holds, or a request for that)
   int32 content_type = 8;
+  // 16 bytes that only the sender and recipient can compute: HMAC of their shared key, the
+  // direction and the 15-minute window. Changes every window, so relays can't link a chat over time.
+  bytes tag = 9;
 }
 
 message ContactPayload {

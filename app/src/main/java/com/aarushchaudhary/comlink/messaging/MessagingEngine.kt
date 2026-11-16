@@ -6,6 +6,7 @@ import com.aarushchaudhary.comlink.ComLinkApp
 import com.aarushchaudhary.comlink.crypto.ContactQr
 import com.aarushchaudhary.comlink.crypto.ReplayWindow
 import com.aarushchaudhary.comlink.crypto.SessionCipher
+import com.aarushchaudhary.comlink.crypto.TagDirectory
 import com.aarushchaudhary.comlink.data.FileTransferManager
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
@@ -13,6 +14,7 @@ import com.aarushchaudhary.comlink.data.SessionStateEntity
 import com.aarushchaudhary.comlink.proto.Envelope
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -37,10 +39,14 @@ class MessagingEngine(
         private const val PRESENCE_INTERVAL_MS = 30_000L
         /** A contact is offline after this long without a PRESENCE (2.5 intervals, so one loss is OK). */
         private const val OFFLINE_AFTER_MS = 75_000L
-        /** A HELLO/PING within this window counts as "nearby". */
+        /** A contact proven nearby (PRESENCE, or a PING from their proven address) within this window. */
         private const val NEARBY_WINDOW_MS = 60_000L
         /** At most one PRESENCE per contact per this long, however many HELLO/PINGs arrive. */
         private const val PRESENCE_MIN_GAP_MS = 20_000L
+        /** An unknown neighbour gets one PRESENCE per contact at most this often (it might be any of them). */
+        private const val STRANGER_PRESENCE_GAP_MS = 60_000L
+        /** READ receipts per envelope (36-character IDs: 40 of them fit the 4 KB padding bucket). */
+        private const val READ_BATCH = 40
         private val PRESENCE_PAYLOAD = "PRESENCE".toByteArray(Charsets.UTF_8)
     }
 
@@ -57,11 +63,16 @@ class MessagingEngine(
     // sender's, so a slow Bluetooth send never delays reading what that contact sends us.
     private val receiveLocks = ConcurrentHashMap<String, Mutex>()
 
-    // Contact -> last time a neighbour claimed to be them (HELLO/PING). Untrusted; only decides
-    // who gets a PRESENCE. Known contacts only, so it can't grow without bound.
+    // Contact -> last time they were proven nearby (their PRESENCE, or a PING from their proven
+    // address). Decides who gets the 30 s PRESENCE. Known contacts only, so it can't grow without bound.
     private val nearbySeenAt = ConcurrentHashMap<String, Long>()
     // Contact -> last time we sent them a PRESENCE
     private val presenceSentAt = ConcurrentHashMap<String, Long>()
+    // Unknown neighbour address -> last time it got our PRESENCEs (pruned, see onNeighbourSeen)
+    private val strangerPresenceAt = ConcurrentHashMap<String, Long>()
+
+    // Tag -> contact, for every contact whose key is loaded in sessionCiphers
+    private val tagDirectory = TagDirectory(contacts = { HashMap(sessionCiphers) })
 
     /**
      * The session cipher for [peerId], or null when there is none: unknown contact, the local Saved
@@ -84,12 +95,11 @@ class MessagingEngine(
 
     // Every outgoing envelope goes through this one sender (it owns the per-contact locks)
     private val sender = EncryptedSender(
-        localDeviceId = identity.getDeviceId(),
         loadCounter = { peerId -> dao.getSessionState(peerId)?.myNextCounter },
         saveCounter = { peerId, next -> dao.updateMyCounter(peerId, next) },
         cipherFor = { peerId -> getOrCreateCipher(peerId) },
-        transmit = { envelope, direct, noResponse ->
-            if (direct) router.sendDirectMessage(envelope.recipient_id, envelope, noResponse)
+        transmit = { peerId, envelope, direct, noResponse ->
+            if (direct) router.sendDirectMessage(peerId, envelope, noResponse)
             else router.sendLocalMessage(envelope)
         }
     )
@@ -106,18 +116,21 @@ class MessagingEngine(
     init {
         // Wired once for the whole app process, not per screen: a closed screen can no longer
         // swallow incoming messages
-        router.onMessageReceived = { envelope, fromAddress ->
-            processIncomingEnvelope(envelope, fromAddress)
+        router.senderOfTag = { tag -> tagDirectory.senderOf(tag) }
+        router.onMessageReceived = { envelope, senderId, fromAddress ->
+            processIncomingEnvelope(envelope, senderId, fromAddress)
         }
-        
-        // A HELLO/PING is only a claim: answer with our PRESENCE. The contact shows online only
-        // once *their* PRESENCE decrypts (handlePresence).
-        app.bluetoothService.onPeerSeen = { peerId ->
-            scope.launch(Dispatchers.IO) {
-                if (dao.getPeer(peerId) == null) return@launch
-                nearbySeenAt[peerId] = System.currentTimeMillis()
-                sendPresence(peerId)
-            }
+
+        // Every contact's key, so their tags are recognised from the first envelope on
+        scope.launch(Dispatchers.IO) {
+            dao.getAllPeers().first().forEach { getOrCreateCipher(it.deviceId) }
+            tagDirectory.invalidate()
+        }
+
+        // HELLO/PING names nobody: answer with PRESENCE. The contact shows online only once
+        // *their* PRESENCE decrypts (handlePresence).
+        app.bluetoothService.onNeighbourSeen = { address ->
+            scope.launch(Dispatchers.IO) { onNeighbourSeen(address) }
         }
         
         app.bluetoothService.onPeerDisconnected = { peerId ->
@@ -153,6 +166,7 @@ class MessagingEngine(
                     if (now - seenAt > NEARBY_WINDOW_MS) nearbySeenAt.remove(peerId, seenAt)
                     else sendPresence(peerId, force = true)
                 }
+                strangerPresenceAt.entries.removeAll { now - it.value > STRANGER_PRESENCE_GAP_MS }
             }
         }
 
@@ -242,7 +256,7 @@ class MessagingEngine(
                         sender.lockFor(peerDeviceId).withLock {
                             dao.updatePeerIdentity(peerDeviceId, peerPubKey, contactName, exchangedName)
                             if (keyChanged) {
-                                // New key = new shared secret and nonce space: drop the cached
+                                // New key = new shared secret, nonce space and tags: drop the cached
                                 // cipher and start counters fresh. Messages are kept.
                                 sessionCiphers.remove(peerDeviceId)
                                 dao.resetSessionState(peerDeviceId)
@@ -255,6 +269,9 @@ class MessagingEngine(
                 if (state == null) {
                     dao.insertSessionState(SessionStateEntity(peerDeviceId))
                 }
+                // Load the (new) key and recognise this contact's tags from now on
+                getOrCreateCipher(peerDeviceId)
+                tagDirectory.invalidate()
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -400,10 +417,13 @@ class MessagingEngine(
         }
     }
 
-    private fun processIncomingEnvelope(envelope: Envelope, fromAddress: String) {
+    /**
+     * [senderId] comes from the envelope's tag, which only that contact's key produces; nothing on
+     * the wire claims a sender any more. Decryption below then proves it.
+     */
+    private fun processIncomingEnvelope(envelope: Envelope, senderId: String, fromAddress: String) {
         scope.launch(Dispatchers.IO) {
-            val senderId = envelope.sender_id ?: return@launch
-            // The local Saved Messages chat is not a real contact: nobody can send "from" it
+            // Safety net: the Saved Messages chat has no key, so no tag can map to it
             if (senderId == SAVED_MESSAGES_ID) return@launch
             // Only known contacts get a lock, so random sender IDs can't grow the lock map
             dao.getPeer(senderId) ?: return@launch
@@ -425,8 +445,7 @@ class MessagingEngine(
 
                 // The header as received: if a relay changed any of these fields, the tag check fails
                 val aad = SessionCipher.envelopeAad(
-                    envelope.sender_id, envelope.recipient_id, envelope.envelope_id,
-                    envelope.content_type, envelope.timestamp
+                    envelope.tag.toByteArray(), envelope.envelope_id, envelope.content_type, envelope.timestamp
                 )
                 val (paddedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes, aad)
                 // Strip the size-bucket padding (authenticated, so a bad length means a broken sender)
@@ -453,7 +472,7 @@ class MessagingEngine(
                     is IncomingMessage.FileStatus -> fileTransferManager.onFileStatusReceived(senderId, incoming.payload)
                     // Only our own message to this contact, and never lower (a late ACK after READ)
                     is IncomingMessage.Ack -> dao.raiseOwnMessageStatus(incoming.messageId, senderId, 2) // Delivered
-                    is IncomingMessage.Read -> dao.raiseOwnMessageStatus(incoming.messageId, senderId, 3) // Seen
+                    is IncomingMessage.Read -> incoming.messageIds.forEach { dao.raiseOwnMessageStatus(it, senderId, 3) } // Seen
                     is IncomingMessage.Unknown -> android.util.Log.w("MessagingEngine", "Ignored unknown content type ${incoming.contentType} from $senderId")
                     is IncomingMessage.Chat -> {
                         val msgEntity = MessageEntity(
@@ -476,6 +495,27 @@ class MessagingEngine(
             } catch (e: Exception) {
                 e.printStackTrace() // Decryption failed
             }
+    }
+
+    /**
+     * A phone running ComLink is connected at [address]. If it's a contact proven there, keep them
+     * fresh. Otherwise it could be any contact (HELLO names nobody), so every contact gets a
+     * PRESENCE; only the right one can read theirs. Throttled per address.
+     */
+    private suspend fun onNeighbourSeen(address: String) {
+        val known = app.bluetoothService.peersAt(address)
+        val now = System.currentTimeMillis()
+        if (known.isNotEmpty()) {
+            for (peerId in known) {
+                nearbySeenAt[peerId] = now
+                sendPresence(peerId)
+            }
+            return
+        }
+        val last = strangerPresenceAt[address]
+        if (last != null && now - last < STRANGER_PRESENCE_GAP_MS) return
+        strangerPresenceAt[address] = now
+        for (peerId in sessionCiphers.keys.toList()) sendPresence(peerId)
     }
 
     /**
@@ -518,9 +558,10 @@ class MessagingEngine(
             // Mark messages as read locally
             dao.markIncomingMessagesAsRead(peerId)
 
-            // Send READ receipts for each unread message
-            for (msg in unread) {
-                sender.send(peerId, "READ:${msg.messageId}".toByteArray(Charsets.UTF_8))
+            // One READ receipt per batch of messages, not one per message
+            for (batch in unread.chunked(READ_BATCH)) {
+                val ids = batch.joinToString(",") { it.messageId }
+                sender.send(peerId, "READ:$ids".toByteArray(Charsets.UTF_8))
             }
         }
     }

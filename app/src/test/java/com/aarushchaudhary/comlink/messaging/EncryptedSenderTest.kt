@@ -28,8 +28,9 @@ class EncryptedSenderTest {
     private val counters = ConcurrentHashMap<String, Int>()
     private val sent = Collections.synchronizedList(mutableListOf<Envelope>())
 
+    private var now = 1_700_000_000_000L
+
     private fun newSender(hasSession: Boolean = true) = EncryptedSender(
-        localDeviceId = "alice",
         loadCounter = { id ->
             // Yield between read and write, the way a real database call would, to invite races
             yield()
@@ -37,7 +38,8 @@ class EncryptedSenderTest {
         },
         saveCounter = { id, next -> yield(); counters[id] = next },
         cipherFor = { cipher },
-        transmit = { envelope, _, _ -> yield(); sent.add(envelope); true }
+        transmit = { _, envelope, _, _ -> yield(); sent.add(envelope); true },
+        clock = { now }
     )
 
     private fun nonceOf(e: Envelope) = e.nonce.toByteArray().toList()
@@ -78,8 +80,8 @@ class EncryptedSenderTest {
         val sender = newSender()
         assertTrue(sender.send(peer, "hi".toByteArray(), contentType = 1, envelopeId = "id-1", timestamp = 123L))
         val e = sent.single()
-        assertEquals("alice", e.sender_id)
-        assertEquals(peer, e.recipient_id)
+        // No IDs on the wire, only the rotating tag for this window
+        assertEquals(cipher.outgoingTag(SessionCipher.tagWindow(now)).toList(), e.tag.toByteArray().toList())
         assertEquals("id-1", e.envelope_id)
         assertEquals(123L, e.timestamp)
         assertEquals(1, e.content_type)
@@ -121,29 +123,32 @@ class EncryptedSenderTest {
         val bobFromAlice = SessionCipher(bobPriv, bobPub, alicePub)
 
         val sender = EncryptedSender(
-            localDeviceId = "alice",
             loadCounter = { 0 },
             saveCounter = { _, _ -> },
             cipherFor = { aliceToBob },
-            transmit = { envelope, _, _ -> sent.add(envelope); true }
+            transmit = { _, envelope, _, _ -> sent.add(envelope); true }
         )
         assertTrue(sender.send(peer, "hi bob".toByteArray(), contentType = 0))
         val e = sent.single()
 
         fun open(env: Envelope) = Padding.unpad(bobFromAlice.decrypt(
             env.ciphertext.toByteArray(), env.nonce.toByteArray(),
-            SessionCipher.envelopeAad(env.sender_id, env.recipient_id, env.envelope_id, env.content_type, env.timestamp)
+            SessionCipher.envelopeAad(env.tag.toByteArray(), env.envelope_id, env.content_type, env.timestamp)
         ).first)!!
 
         assertEquals("hi bob", String(open(e)))
         // A relay may lower ttl: still fine
         assertEquals("hi bob", String(open(e.copy(ttl = 3))))
-        // A relay flipping the content type (text -> file part) is caught
-        try {
-            open(e.copy(content_type = 2))
-            org.junit.Assert.fail("tampered content_type must not decrypt")
-        } catch (expected: javax.crypto.AEADBadTagException) {
+        // A relay flipping the content type (text -> file part) or swapping the tag is caught
+        for (tampered in listOf(e.copy(content_type = 2), e.copy(tag = okio.ByteString.of(*ByteArray(16))))) {
+            try {
+                open(tampered)
+                org.junit.Assert.fail("tampered header must not decrypt")
+            } catch (expected: javax.crypto.AEADBadTagException) {
+            }
         }
+        // And bob recognises the tag as alice's
+        assertEquals(bobFromAlice.incomingTag(SessionCipher.tagWindow(System.currentTimeMillis())).toList(), e.tag.toByteArray().toList())
     }
 
     @Test
@@ -166,5 +171,17 @@ class EncryptedSenderTest {
         assertFalse(sender.send(peer, "hi".toByteArray()))
         assertNull(sender.reserveCounters(peer, 3))
         assertTrue(sent.isEmpty())
+    }
+
+    @Test
+    fun tagFollowsTheSendTimeNotTheMessageTimestamp() = runBlocking {
+        val sender = newSender()
+        // A retry of a message written two hours ago keeps its old timestamp...
+        sender.send(peer, "x".toByteArray(), envelopeId = "m1", timestamp = now - 2 * 3_600_000L)
+        // ...but is tagged for the window it's sent in, so the receiver still recognises it
+        assertEquals(cipher.outgoingTag(SessionCipher.tagWindow(now)).toList(), sent.single().tag.toByteArray().toList())
+        now += SessionCipher.TAG_WINDOW_MS
+        sender.send(peer, "x".toByteArray(), envelopeId = "m1", timestamp = now - 2 * 3_600_000L)
+        assertEquals(cipher.outgoingTag(SessionCipher.tagWindow(now)).toList(), sent.last().tag.toByteArray().toList())
     }
 }

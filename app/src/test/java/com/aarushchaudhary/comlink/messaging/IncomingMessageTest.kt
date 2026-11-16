@@ -18,7 +18,10 @@ class IncomingMessageTest {
     @Test
     fun ackAndRead() {
         assertEquals(IncomingMessage.Ack("abc-123"), msg("ACK:abc-123"))
-        assertEquals(IncomingMessage.Read("abc-123"), msg("READ:abc-123"))
+        assertEquals(IncomingMessage.Read(listOf("abc-123")), msg("READ:abc-123"))
+        // One receipt for several messages
+        assertEquals(IncomingMessage.Read(listOf("a-1", "b-2", "c-3")), msg("READ:a-1,b-2,c-3"))
+        assertEquals(IncomingMessage.Read(emptyList()), msg("READ:"))
     }
 
     @Test

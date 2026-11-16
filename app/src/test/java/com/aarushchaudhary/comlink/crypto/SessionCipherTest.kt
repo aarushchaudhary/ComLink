@@ -21,7 +21,8 @@ class SessionCipherTest {
     private val aliceToBob = alice.cipherWith(bob)
     private val bobFromAlice = bob.cipherWith(alice)
 
-    private val header = SessionCipher.envelopeAad("alice", "bob", "env-1", 0, 1_700_000_000_000L)
+    private val tag = aliceToBob.outgoingTag(1L)
+    private val header = SessionCipher.envelopeAad(tag, "env-1", 0, 1_700_000_000_000L)
 
     @Test
     fun roundTripBetweenTwoParties() {
@@ -68,11 +69,10 @@ class SessionCipherTest {
         val ciphertext = aliceToBob.encrypt("meet at 6".toByteArray(), 9, header)
         val nonce = aliceToBob.constructNonce(9)
         val tampered = mapOf(
-            "sender" to SessionCipher.envelopeAad("mallory", "bob", "env-1", 0, 1_700_000_000_000L),
-            "recipient" to SessionCipher.envelopeAad("alice", "carol", "env-1", 0, 1_700_000_000_000L),
-            "envelope_id" to SessionCipher.envelopeAad("alice", "bob", "env-2", 0, 1_700_000_000_000L),
-            "content_type" to SessionCipher.envelopeAad("alice", "bob", "env-1", 2, 1_700_000_000_000L),
-            "timestamp" to SessionCipher.envelopeAad("alice", "bob", "env-1", 0, 1_600_000_000_000L)
+            "tag" to SessionCipher.envelopeAad(aliceToBob.outgoingTag(2L), "env-1", 0, 1_700_000_000_000L),
+            "envelope_id" to SessionCipher.envelopeAad(tag, "env-2", 0, 1_700_000_000_000L),
+            "content_type" to SessionCipher.envelopeAad(tag, "env-1", 2, 1_700_000_000_000L),
+            "timestamp" to SessionCipher.envelopeAad(tag, "env-1", 0, 1_600_000_000_000L)
         )
         for ((field, aad) in tampered) {
             try {
@@ -87,10 +87,10 @@ class SessionCipherTest {
 
     @Test
     fun headerFieldBoundariesCannotBeShifted() {
-        // "ab"+"c" and "a"+"bc" must give different AAD, thanks to the length prefixes
+        // tag "ab" + id "c" and tag "a" + id "bc" must give different AAD, thanks to the length prefixes
         assertNotEquals(
-            SessionCipher.envelopeAad("ab", "c", "x", 0, 0).toList(),
-            SessionCipher.envelopeAad("a", "bc", "x", 0, 0).toList()
+            SessionCipher.envelopeAad("ab".toByteArray(), "c", 0, 0).toList(),
+            SessionCipher.envelopeAad("a".toByteArray(), "bc", 0, 0).toList()
         )
     }
 
@@ -99,5 +99,32 @@ class SessionCipherTest {
         val nonces = (0 until 1000).map { aliceToBob.constructNonce(it).toList() }.toSet()
         assertEquals(1000, nonces.size)
         assertNotEquals(aliceToBob.constructNonce(5).toList(), bobFromAlice.constructNonce(5).toList())
+    }
+
+    @Test
+    fun tagsMatchAcrossTheTwoPhonesAndDifferByDirection() {
+        // What alice puts on envelopes to bob is exactly what bob expects from alice
+        assertArrayEquals(aliceToBob.outgoingTag(7L), bobFromAlice.incomingTag(7L))
+        assertArrayEquals(bobFromAlice.outgoingTag(7L), aliceToBob.incomingTag(7L))
+        // The two directions of one chat don't share a tag, so they can't be linked to each other
+        assertNotEquals(aliceToBob.outgoingTag(7L).toList(), aliceToBob.incomingTag(7L).toList())
+        assertEquals(SessionCipher.TAG_SIZE, aliceToBob.outgoingTag(7L).size)
+    }
+
+    @Test
+    fun tagChangesEveryWindowAndPerContact() {
+        val tags = (0L until 100L).map { aliceToBob.outgoingTag(it).toList() }.toSet()
+        assertEquals(100, tags.size)
+        // Another contact's tags for the same window are unrelated
+        val carol = Party()
+        assertNotEquals(aliceToBob.outgoingTag(7L).toList(), alice.cipherWith(carol).outgoingTag(7L).toList())
+    }
+
+    @Test
+    fun tagWindowIsFifteenMinutes() {
+        assertEquals(0L, SessionCipher.tagWindow(0L))
+        assertEquals(0L, SessionCipher.tagWindow(15 * 60_000L - 1))
+        assertEquals(1L, SessionCipher.tagWindow(15 * 60_000L))
+        assertEquals(-1L, SessionCipher.tagWindow(-1L)) // a clock before 1970 still gets a window
     }
 }

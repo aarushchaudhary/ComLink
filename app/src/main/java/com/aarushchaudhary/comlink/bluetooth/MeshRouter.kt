@@ -7,16 +7,23 @@ import java.util.LinkedHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 
-class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
+class MeshRouter(private val scope: CoroutineScope) {
 
     companion object {
         /** Most hops a relayed envelope may still make; our own messages start at 10 too. */
         const val MAX_TTL = 10
     }
 
-    // Listener for messages that are destined for this device. [fromAddress] is the Bluetooth address
-    // of the neighbour that handed it over (for PRESENCE: the contact's own address).
-    var onMessageReceived: ((envelope: Envelope, fromAddress: String) -> Unit)? = null
+    /**
+     * Which contact sent an envelope with this tag, or null when it isn't for us (see TagDirectory).
+     * Nothing on the wire names the recipient, so this is how we know an envelope is ours.
+     */
+    var senderOfTag: ((tag: ByteArray) -> String?)? = null
+
+    // Listener for messages that are destined for this device, with the contact the tag belongs to.
+    // [fromAddress] is the Bluetooth address of the neighbour that handed it over (for PRESENCE:
+    // the contact's own address).
+    var onMessageReceived: ((envelope: Envelope, senderId: String, fromAddress: String) -> Unit)? = null
     
     // Callback to physically broadcast an envelope to all active Bluetooth connections
     var broadcastToNetwork: (suspend (ByteArray) -> Boolean)? = null
@@ -48,35 +55,37 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
             return
         }
 
-        // 1. Check LRU cache to prevent broadcast storms
+        // 1. Is it for us? Then always hand it over, even if this ID was seen before: a retry keeps
+        // the message's ID, and dropping it here meant a lost ACK was never answered. The receiver's
+        // replay window already drops true duplicates.
+        val senderId = senderOfTag?.invoke(envelope.tag.toByteArray())
+        if (senderId != null) {
+            seenEnvelopes[envelope.envelope_id] = true
+            onMessageReceived?.invoke(envelope, senderId, fromAddress)
+            return
+        }
+
+        // 2. Not ours: check the LRU cache to prevent broadcast storms
         if (seenEnvelopes.containsKey(envelope.envelope_id)) {
             return // Already seen this envelope, drop it
         }
-
-        // Add to cache
         seenEnvelopes[envelope.envelope_id] = true
 
-        // 2. Check if the message is for this device
-        if (envelope.recipient_id == localDeviceId) {
-            // Pass to crypto layer for decryption
-            onMessageReceived?.invoke(envelope, fromAddress)
-        } else {
-            // 3. Multi-hop Relay Logic
-            // We never attempt to decrypt ciphertext if we are not the recipient
-            // Capped at MAX_TTL, so a sender can't make an envelope hop (and flood the mesh) forever
-            val newTtl = minOf((envelope.ttl ?: 0) - 1, MAX_TTL)
-            if (newTtl > 0) {
-                if (!relayLimiter.allow(fromAddress)) {
-                    Log.w("MeshRouter", "Relay limit reached for $fromAddress; dropping")
-                    return
-                }
-                // Rebuild envelope with decremented TTL
-                val relayedEnvelope = envelope.copy(ttl = newTtl)
-                val encodedBytes = relayedEnvelope.encode()
-                // Broadcast to all connected sockets in background
-                scope.launch {
-                    broadcastToNetwork?.invoke(encodedBytes)
-                }
+        // 3. Multi-hop Relay Logic
+        // We never attempt to decrypt ciphertext if we are not the recipient
+        // Capped at MAX_TTL, so a sender can't make an envelope hop (and flood the mesh) forever
+        val newTtl = minOf((envelope.ttl ?: 0) - 1, MAX_TTL)
+        if (newTtl > 0) {
+            if (!relayLimiter.allow(fromAddress)) {
+                Log.w("MeshRouter", "Relay limit reached for $fromAddress; dropping")
+                return
+            }
+            // Rebuild envelope with decremented TTL
+            val relayedEnvelope = envelope.copy(ttl = newTtl)
+            val encodedBytes = relayedEnvelope.encode()
+            // Broadcast to all connected sockets in background
+            scope.launch {
+                broadcastToNetwork?.invoke(encodedBytes)
             }
         }
     }
