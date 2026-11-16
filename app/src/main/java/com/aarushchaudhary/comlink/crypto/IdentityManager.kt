@@ -8,7 +8,6 @@ import com.google.crypto.tink.KeyTemplates
 import com.google.crypto.tink.aead.AeadConfig
 import com.google.crypto.tink.integration.android.AndroidKeysetManager
 import com.google.crypto.tink.subtle.X25519
-import java.security.MessageDigest
 
 class IdentityManager(private val context: Context) {
 
@@ -70,31 +69,5 @@ class IdentityManager(private val context: Context) {
 
     fun getDeviceId(): String {
         return prefs.getString(PREF_DEVICE_ID, null) ?: throw IllegalStateException("Identity not initialized")
-    }
-
-    /**
-     * Generates a SHA-256 fingerprint for visual confirmation during the QR Handshake.
-     * The fingerprint is derived by hashing the lexicographically sorted public keys to ensure
-     * both parties generate the exact same fingerprint regardless of who scanned who.
-     */
-    fun generateFingerprint(peerPublicKey: ByteArray): String {
-        val myPubKey = getPublicKey()
-        val md = MessageDigest.getInstance("SHA-256")
-        
-        // Sort to ensure determinism
-        val isMyKeyFirst = SessionCipher.compareByteArrays(myPubKey, peerPublicKey) <= 0
-        if (isMyKeyFirst) {
-            md.update(myPubKey)
-            md.update(peerPublicKey)
-        } else {
-            md.update(peerPublicKey)
-            md.update(myPubKey)
-        }
-        
-        val hash = md.digest()
-        
-        // Format as a hex string grouped for easy reading (e.g., "A1B2-C3D4-...")
-        val hex = hash.joinToString("") { "%02X".format(it) }
-        return hex.chunked(4).joinToString("-")
     }
 }

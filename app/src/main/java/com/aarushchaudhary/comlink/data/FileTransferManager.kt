@@ -75,7 +75,8 @@ class FileTransferManager(
     enum class SendFileResult { SENT, TOO_LARGE, UNREADABLE, NOT_SENT }
 
     private sealed class ReadResult {
-        class Ok(val bytes: ByteArray) : ReadResult()
+        /** [asJpeg]: an image that was shrunk and re-encoded as JPEG. */
+        class Ok(val bytes: ByteArray, val asJpeg: Boolean = false) : ReadResult()
         object TooLarge : ReadResult()
         object Unreadable : ReadResult()
     }
@@ -90,25 +91,33 @@ class FileTransferManager(
         messageId: String
     ): SendFileResult {
         val contentResolver = context.contentResolver
-        val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-        val fileName = getFileName(uri) ?: "file"
+        var mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+        var fileName = getFileName(uri) ?: "file"
         val transferId = messageId
 
         val fileBytes = when (val read = readForSending(uri, mimeType)) {
-            is ReadResult.Ok -> read.bytes
+            is ReadResult.Ok -> {
+                if (read.asJpeg && mimeType != "image/jpeg") {
+                    // The bytes are JPEG now: name and type must say so, or a saved copy would be
+                    // e.g. "photo.png" holding JPEG data
+                    mimeType = "image/jpeg"
+                    fileName = fileName.substringBeforeLast('.', fileName) + ".jpg"
+                }
+                read.bytes
+            }
             ReadResult.TooLarge -> {
                 Log.e(TAG, "File too large to send: $uri (max $MAX_FILE_SIZE bytes)")
-                recordFailedTransfer(transferId, peerId, fileName, mimeType)
                 return SendFileResult.TOO_LARGE
             }
             ReadResult.Unreadable -> {
                 Log.e(TAG, "Cannot read file: $uri")
-                recordFailedTransfer(transferId, peerId, fileName, mimeType)
                 return SendFileResult.UNREADABLE
             }
         }
 
         val partCount = TransferChecks.expectedPartCount(fileBytes.size.toLong())
+        // Our own bubble shows what was actually sent
+        dao.updateFileMeta(messageId, fileName, mimeType, fileBytes.size.toLong())
 
         // Generate thumbnail for images
         val thumbnailBytes = if (mimeType.startsWith("image/")) {
@@ -374,21 +383,6 @@ class FileTransferManager(
         }
     }
 
-    /** A transfer that never started (too large or unreadable), recorded so it shows as failed. */
-    private suspend fun recordFailedTransfer(transferId: String, peerId: String, fileName: String, mimeType: String) {
-        dao.insertFileTransfer(FileTransferEntity(
-            transferId = transferId,
-            messageId = transferId,
-            peerDeviceId = peerId,
-            fileName = fileName,
-            mimeType = mimeType,
-            fileSize = 0,
-            partCount = 0,
-            isOutgoing = true,
-            status = "FAILED"
-        ))
-    }
-
     /**
      * Reads the bytes to send without ever loading more than [MAX_FILE_SIZE] + 1 bytes.
      * Images are shrunk straight from the stream; anything that can't be decoded as an image is
@@ -397,7 +391,7 @@ class FileTransferManager(
     private fun readForSending(uri: Uri, mimeType: String): ReadResult {
         if (mimeType.startsWith("image/")) {
             compressImage(uri)?.let { jpeg ->
-                return if (jpeg.size > MAX_FILE_SIZE) ReadResult.TooLarge else ReadResult.Ok(jpeg)
+                return if (jpeg.size > MAX_FILE_SIZE) ReadResult.TooLarge else ReadResult.Ok(jpeg, asJpeg = true)
             }
         }
         val declaredSize = getFileSize(uri)
@@ -819,6 +813,24 @@ class FileTransferManager(
         } catch (e: OutOfMemoryError) {
             Log.e(TAG, "Image too large to compress", e)
             null
+        }
+    }
+
+    /**
+     * Save to device: copies our local copy at [filePath] to [destination], a document the user
+     * just created in the system "Save as" screen. No storage permission is needed for that.
+     * Returns false if anything fails (the half-written document is then left to the user).
+     */
+    fun exportToDevice(filePath: String, destination: Uri): Boolean {
+        val source = File(filePath)
+        if (!source.exists()) return false
+        return try {
+            val out = context.contentResolver.openOutputStream(destination, "w") ?: return false
+            out.use { output -> source.inputStream().use { input -> FileCopy.copy(input, output) } }
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "Save to device failed for $destination", e)
+            false
         }
     }
 

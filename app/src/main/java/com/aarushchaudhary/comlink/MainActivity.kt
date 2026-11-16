@@ -315,7 +315,7 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
             title = { Text("> VERIFY FINGERPRINT <", fontFamily = FontFamily.Monospace, color = accentColor, fontWeight = FontWeight.Bold) },
             text = {
                 Column {
-                    Text("Manual verification required:", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace, color = androidx.compose.ui.graphics.Color.LightGray)
+                    Text("Check it matches the fingerprint under their QR code:", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace, color = androidx.compose.ui.graphics.Color.LightGray)
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(fingerprint, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold, color = accentColor)
                     Spacer(modifier = Modifier.height(16.dp))
@@ -440,8 +440,22 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
                 val myName by context.dataStore.data.map { it[com.aarushchaudhary.comlink.ui.theme.myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
                 val qrBitmap = remember(myName) { QrUtils.generateQrBitmap(viewModel.getMyQrPayload(myName)) }
                 Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = "QR Code", modifier = Modifier.size(250.dp).border(2.dp, accentColor))
-                
-                Spacer(modifier = Modifier.height(32.dp))
+
+                // Whoever scans this sees the same fingerprint in their dialog, so they can compare
+                Spacer(modifier = Modifier.height(16.dp))
+                Text("YOUR KEY FINGERPRINT", color = androidx.compose.ui.graphics.Color.Gray, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                Spacer(modifier = Modifier.height(4.dp))
+                val myFingerprint = remember { viewModel.myFingerprint() }
+                Text(
+                    myFingerprint,
+                    color = accentColor,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center
+                )
+
+                Spacer(modifier = Modifier.height(24.dp))
                 Button(
                     onClick = { showMyQr = false },
                     colors = ButtonDefaults.buttonColors(containerColor = androidx.compose.ui.graphics.Color.DarkGray)

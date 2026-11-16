@@ -331,7 +331,23 @@ class MessagingEngine(
             dao.updatePeerLastMessageTime(peerId, message.timestamp)
 
             // Launch the multi-envelope transfer
-            fileTransferManager.sendFile(peerId, uri, messageId)
+            val problem = when (fileTransferManager.sendFile(peerId, uri, messageId)) {
+                FileTransferManager.SendFileResult.TOO_LARGE -> "File too large to send (max 10 MB)"
+                FileTransferManager.SendFileResult.UNREADABLE -> "Couldn't read this file"
+                else -> null
+            }
+            if (problem != null) {
+                // Nothing was saved or sent, and nothing ever could be: remove the bubble, say why
+                dao.deleteMessage(messageId)
+                showToast(problem)
+            }
+        }
+    }
+
+    /** Short message for the user; works from any thread, even with the chat screen closed. */
+    private fun showToast(text: String) {
+        android.os.Handler(android.os.Looper.getMainLooper()).post {
+            android.widget.Toast.makeText(app, text, android.widget.Toast.LENGTH_LONG).show()
         }
     }
 

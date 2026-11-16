@@ -1,10 +1,13 @@
 package com.aarushchaudhary.comlink.ui.conversation
 
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContract
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
@@ -26,6 +29,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalClipboardManager
@@ -36,7 +40,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.compose.runtime.saveable.rememberSaveable
+import com.aarushchaudhary.comlink.data.FileCopy
 import com.aarushchaudhary.comlink.data.MessageEntity
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.aarushchaudhary.comlink.ui.ComLinkViewModel
 import java.io.File
 import java.text.SimpleDateFormat
@@ -70,72 +79,45 @@ fun ConversationScreen(
     val accentColor = MaterialTheme.colorScheme.primary
     val backgroundColor = MaterialTheme.colorScheme.background
 
-    // File pickers
-    val imagePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            viewModel.sendFileMessage(
-                peerId = peerId,
-                uri = it,
-                replyToId = replyingTo?.messageId,
-                replyToSender = if (replyingTo?.isFromMe == true) "You" else contactName,
-                replyToSnippet = replyingTo?.plaintext?.take(50)
-            )
-            replyingTo = null
-        }
-        showAttachmentPicker = false
-    }
-
-    val documentPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.OpenDocument()
-    ) { uri: Uri? ->
-        uri?.let {
-            viewModel.sendFileMessage(
-                peerId = peerId,
-                uri = it,
-                replyToId = replyingTo?.messageId,
-                replyToSender = if (replyingTo?.isFromMe == true) "You" else contactName,
-                replyToSnippet = replyingTo?.plaintext?.take(50)
-            )
-            replyingTo = null
-        }
-        showAttachmentPicker = false
-    }
-
-    val audioPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            viewModel.sendFileMessage(
-                peerId = peerId,
-                uri = it,
-                replyToId = replyingTo?.messageId,
-                replyToSender = if (replyingTo?.isFromMe == true) "You" else contactName,
-                replyToSnippet = replyingTo?.plaintext?.take(50)
-            )
-            replyingTo = null
-        }
-        showAttachmentPicker = false
-    }
-
-    val videoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        uri?.let {
-            viewModel.sendFileMessage(
-                peerId = peerId,
-                uri = it,
-                replyToId = replyingTo?.messageId,
-                replyToSender = if (replyingTo?.isFromMe == true) "You" else contactName,
-                replyToSnippet = replyingTo?.plaintext?.take(50)
-            )
-            replyingTo = null
-        }
-        showAttachmentPicker = false
-    }
-
     val context = LocalContext.current
+
+    // File pickers: one shared handler. Image, audio and video use the same "get content"
+    // launcher with a different type filter; documents use the system document picker.
+    val onFilePicked: (Uri?) -> Unit = { uri ->
+        uri?.let {
+            viewModel.sendFileMessage(
+                peerId = peerId,
+                uri = it,
+                replyToId = replyingTo?.messageId,
+                replyToSender = if (replyingTo?.isFromMe == true) "You" else contactName,
+                replyToSnippet = replyingTo?.plaintext?.take(50)
+            )
+            replyingTo = null
+        }
+        showAttachmentPicker = false
+    }
+    val contentPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetContent(), onFilePicked)
+    val documentPickerLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument(), onFilePicked)
+
+    // Save to device: the system "Save as" screen picks the folder and name. Only the message ID is
+    // remembered (saveable), so it survives the activity being recreated while that screen is open.
+    var pendingSaveId by rememberSaveable { mutableStateOf<String?>(null) }
+    val saveScope = rememberCoroutineScope()
+    val saveLauncher = rememberLauncherForActivityResult(SaveAsDocument()) { destination: Uri? ->
+        val msg = messages.firstOrNull { it.messageId == pendingSaveId }
+        pendingSaveId = null
+        if (destination != null && msg != null) {
+            saveScope.launch {
+                val saved = viewModel.saveFileToDevice(msg, destination)
+                android.widget.Toast.makeText(
+                    context,
+                    if (saved) "Saved" else "Couldn't save",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+    }
+
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
@@ -361,6 +343,24 @@ fun ConversationScreen(
                         colors = ListItemDefaults.colors(containerColor = backgroundColor)
                     )
                 }
+                // Save to device: any finished image, video, audio or document, sent or received
+                val menuMsg = showContextMenuFor!!
+                val canSaveToDevice = menuMsg.messageType in setOf("IMAGE", "VIDEO", "AUDIO", "DOCUMENT") &&
+                    menuMsg.filePath?.let { File(it).exists() } == true
+                if (canSaveToDevice) {
+                    ListItem(
+                        headlineContent = { Text("> SAVE TO DEVICE", color = accentColor, fontFamily = FontFamily.Monospace) },
+                        supportingContent = { Text("Choose a folder in your phone's storage", color = Color.Gray, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
+                        modifier = Modifier.clickable {
+                            pendingSaveId = menuMsg.messageId
+                            saveLauncher.launch(
+                                FileCopy.suggestedName(menuMsg.fileName) to (menuMsg.fileMimeType ?: "application/octet-stream")
+                            )
+                            showContextMenuFor = null
+                        },
+                        colors = ListItemDefaults.colors(containerColor = backgroundColor)
+                    )
+                }
                 if (!isSavedMessages) {
                     ListItem(
                         headlineContent = { Text("> SAVE MESSAGE", color = accentColor, fontFamily = FontFamily.Monospace) },
@@ -390,7 +390,7 @@ fun ConversationScreen(
                     headlineContent = { Text("> IMAGE", color = accentColor, fontFamily = FontFamily.Monospace) },
                     supportingContent = { Text("Send a photo", color = Color.Gray, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
                     modifier = Modifier.clickable {
-                        imagePickerLauncher.launch("image/*")
+                        contentPickerLauncher.launch("image/*")
                     },
                     colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
@@ -406,7 +406,7 @@ fun ConversationScreen(
                     headlineContent = { Text("> AUDIO", color = accentColor, fontFamily = FontFamily.Monospace) },
                     supportingContent = { Text("Send an audio file", color = Color.Gray, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
                     modifier = Modifier.clickable {
-                        audioPickerLauncher.launch("audio/*")
+                        contentPickerLauncher.launch("audio/*")
                     },
                     colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
@@ -414,7 +414,7 @@ fun ConversationScreen(
                     headlineContent = { Text("> VIDEO", color = accentColor, fontFamily = FontFamily.Monospace) },
                     supportingContent = { Text("Send a video file", color = Color.Gray, fontFamily = FontFamily.Monospace, fontSize = 12.sp) },
                     modifier = Modifier.clickable {
-                        videoPickerLauncher.launch("video/*")
+                        contentPickerLauncher.launch("video/*")
                     },
                     colors = ListItemDefaults.colors(containerColor = backgroundColor)
                 )
@@ -436,6 +436,65 @@ fun ConversationScreen(
     }
 }
 
+// ─── Save to device ────────────────────────────────────────────────────
+
+/**
+ * Opens the system "Save as" screen (Storage Access Framework, API 19+) for a (file name, MIME type)
+ * pair and returns the document the user created, or null if they backed out. Unlike the built-in
+ * CreateDocument contract, the MIME type is set per file.
+ */
+private class SaveAsDocument : ActivityResultContract<Pair<String, String>, Uri?>() {
+    override fun createIntent(context: Context, input: Pair<String, String>): Intent =
+        Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType(input.second)
+            .putExtra(Intent.EXTRA_TITLE, input.first)
+
+    override fun parseResult(resultCode: Int, intent: Intent?): Uri? =
+        if (resultCode == Activity.RESULT_OK) intent?.data else null
+}
+
+// ─── Image decoding (off the main thread, at a bounded size) ───────────
+
+private sealed interface DecodedImage {
+    object Loading : DecodedImage
+    object Failed : DecodedImage
+    class Ready(val bitmap: ImageBitmap) : DecodedImage
+}
+
+/** Longest side, in pixels, of an image shown in a chat bubble (bubbles are at most ~300 dp). */
+private const val BUBBLE_IMAGE_MAX_PX = 1024
+
+/**
+ * Decodes [path] on a background thread as a copy at most [maxPx] on its longest side, so a huge
+ * photo can't freeze the chat or run it out of memory. Re-decodes only when [path] changes.
+ */
+@Composable
+private fun rememberDecodedImage(path: String, maxPx: Int = BUBBLE_IMAGE_MAX_PX): DecodedImage {
+    val state = produceState<DecodedImage>(initialValue = DecodedImage.Loading, path) {
+        value = withContext(Dispatchers.IO) {
+            decodeSampled(path, maxPx)?.let { DecodedImage.Ready(it.asImageBitmap()) } ?: DecodedImage.Failed
+        }
+    }
+    return state.value
+}
+
+private fun decodeSampled(path: String, maxPx: Int): android.graphics.Bitmap? = try {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+        null
+    } else {
+        var sampleSize = 1
+        while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > maxPx) sampleSize *= 2
+        BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sampleSize })
+    }
+} catch (e: Exception) {
+    null
+} catch (e: OutOfMemoryError) {
+    null
+}
+
 // ─── Media Message Composables ─────────────────────────────────────────
 
 @Composable
@@ -444,13 +503,10 @@ private fun ImageMessageContent(msg: MessageEntity, accentColor: Color, backgrou
     val thumbnailPath = msg.thumbnailPath
 
     if (filePath != null && File(filePath).exists()) {
-        // Transfer complete — show full image
-        val bitmap = remember(filePath) {
-            BitmapFactory.decodeFile(filePath)
-        }
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap.asImageBitmap(),
+        // Transfer complete — show the image (decoded off the main thread, at bubble size)
+        when (val decoded = rememberDecodedImage(filePath)) {
+            is DecodedImage.Ready -> Image(
+                bitmap = decoded.bitmap,
                 contentDescription = msg.fileName ?: "Image",
                 modifier = Modifier
                     .widthIn(max = 240.dp)
@@ -458,18 +514,16 @@ private fun ImageMessageContent(msg: MessageEntity, accentColor: Color, backgrou
                     .clip(RoundedCornerShape(2.dp)),
                 contentScale = ContentScale.Fit
             )
-        } else {
-            FileErrorPlaceholder(msg, accentColor)
+            DecodedImage.Loading -> Box(Modifier.size(width = 240.dp, height = 160.dp).background(Color(0xFF111111)))
+            DecodedImage.Failed -> FileErrorPlaceholder(msg, accentColor)
         }
     } else if (thumbnailPath != null && File(thumbnailPath).exists()) {
         // In progress — show thumbnail + progress
         Box {
-            val thumbBitmap = remember(thumbnailPath) {
-                BitmapFactory.decodeFile(thumbnailPath)
-            }
-            if (thumbBitmap != null) {
+            val thumb = rememberDecodedImage(thumbnailPath)
+            if (thumb is DecodedImage.Ready) {
                 Image(
-                    bitmap = thumbBitmap.asImageBitmap(),
+                    bitmap = thumb.bitmap,
                     contentDescription = "Thumbnail",
                     modifier = Modifier
                         .widthIn(max = 240.dp)
@@ -720,12 +774,10 @@ private fun VideoMessageContent(msg: MessageEntity, accentColor: Color, backgrou
             .background(Color.DarkGray)
     ) {
         if (msg.thumbnailPath != null && File(msg.thumbnailPath).exists()) {
-            val thumbBitmap = remember(msg.thumbnailPath) {
-                BitmapFactory.decodeFile(msg.thumbnailPath)
-            }
-            if (thumbBitmap != null) {
+            val thumb = rememberDecodedImage(msg.thumbnailPath)
+            if (thumb is DecodedImage.Ready) {
                 Image(
-                    bitmap = thumbBitmap.asImageBitmap(),
+                    bitmap = thumb.bitmap,
                     contentDescription = "Video Thumbnail",
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,

@@ -72,7 +72,7 @@ class SessionCipher(
 
         /**
          * Compares byte arrays as unsigned bytes, then by length. Both phones use it to order their
-         * two public keys the same way (direction bytes here, fingerprints in IdentityManager).
+         * two public keys the same way, which gives each side a different nonce direction byte.
          */
         internal fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
             for (i in 0 until minOf(a.size, b.size)) {

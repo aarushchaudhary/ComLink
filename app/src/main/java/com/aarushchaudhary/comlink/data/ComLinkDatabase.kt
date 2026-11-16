@@ -126,6 +126,13 @@ interface ComLinkDao {
     @Query("SELECT * FROM messages WHERE messageId = :messageId LIMIT 1")
     suspend fun getMessage(messageId: String): MessageEntity?
 
+    @Query("DELETE FROM messages WHERE messageId = :messageId")
+    suspend fun deleteMessage(messageId: String)
+
+    /** The sender's own file message, after its image was converted (e.g. PNG -> JPEG). */
+    @Query("UPDATE messages SET fileName = :fileName, fileMimeType = :mimeType, fileSize = :fileSize WHERE messageId = :messageId")
+    suspend fun updateFileMeta(messageId: String, fileName: String, mimeType: String, fileSize: Long)
+
     // Current code never stores ACKs, but app versions before ACK support stored a newer phone's
     // "ACK:<id>" as an ordinary text; this keeps those old rows hidden
     @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND plaintext NOT LIKE 'ACK:%' ORDER BY timestamp ASC")

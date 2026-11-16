@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aarushchaudhary.comlink.ComLinkApp
 import com.aarushchaudhary.comlink.crypto.ContactQr
+import com.aarushchaudhary.comlink.crypto.Fingerprint
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
 import com.aarushchaudhary.comlink.messaging.MeshService
@@ -79,18 +80,18 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Fingerprint for the scan dialog. [scannedText] is the whole QR (current format) or just the
-     * key part (old "deviceId:key" format); both give the same fingerprint for the same key.
-     * Shows "ERROR" when there's no valid 32-byte key, instead of a fingerprint of the wrong bytes.
+     * Fingerprint of the scanned contact's key, for the scan dialog. [scannedText] is the whole QR
+     * (current format) or just the key part (old "deviceId:key" format); both give the same
+     * fingerprint for the same key. "ERROR" when there's no valid 32-byte key.
+     * It should match what the other phone shows under its QR code ([myFingerprint]).
      */
     fun generateFingerprint(scannedText: String): String {
         val peerPubKey = ContactQr.publicKeyFrom(scannedText) ?: return "ERROR"
-        return try {
-            identity.generateFingerprint(peerPubKey)
-        } catch (e: Exception) {
-            "ERROR"
-        }
+        return Fingerprint.of(peerPubKey)
     }
+
+    /** Fingerprint of our own key, shown under our QR code. */
+    fun myFingerprint(): String = Fingerprint.of(identity.getPublicKey())
 
     // ─── Pass-through to the engine (work continues even if this screen closes) ───
 
@@ -132,4 +133,11 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     fun sendSavedNote(text: String) = engine.sendSavedNote(text)
 
     fun togglePin(peerId: String, isPinned: Boolean) = engine.togglePin(peerId, isPinned)
+
+    /** Save to device: copies the message's file to [destination] (picked in "Save as"). True if saved. */
+    suspend fun saveFileToDevice(msg: MessageEntity, destination: Uri): Boolean =
+        kotlinx.coroutines.withContext(Dispatchers.IO) {
+            val path = msg.filePath ?: return@withContext false
+            engine.fileTransferManager.exportToDevice(path, destination)
+        }
 }
