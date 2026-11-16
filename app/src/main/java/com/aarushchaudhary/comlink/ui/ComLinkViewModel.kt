@@ -161,25 +161,11 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         
         viewModelScope.launch(Dispatchers.IO) {
             
-            // 1. Jumpstart / Resume File Transfers
-            if (msg.fileTransferId != null && msg.filePath != null) {
-                val file = java.io.File(msg.filePath)
-                if (!file.exists()) return@launch
-                
-                // Get accurate resume point from DB
-                val transfer = dao.getFileTransfer(msg.fileTransferId)
-                val partCount = transfer?.partCount 
-                    ?: kotlin.math.ceil(file.length().toDouble() / com.aarushchaudhary.comlink.data.FileTransferManager.PART_SIZE).toInt()
-                val startPart = transfer?.lastSentPartIndex ?: 0
-                
-                fileTransferManager.resumeOutgoingTransfer(
-                    transferId = msg.fileTransferId,
-                    peerId = peerId,
-                    messageId = msg.messageId,
-                    filePath = msg.filePath,
-                    partCount = partCount,
-                    startPart = startPart
-                )
+            // 1. Jumpstart / Resume File Transfers. A file message never goes down the text path:
+            // with no local copy (too large, or unreadable) there is nothing to resend.
+            if (msg.fileTransferId != null) {
+                val current = dao.getMessage(msg.messageId) ?: msg
+                fileTransferManager.resumeOutgoingTransfer(peerId, current)
                 return@launch
             }
 
@@ -254,9 +240,27 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                     }
                 }
                 
-                val peer = PeerEntity(peerDeviceId, peerPubKey, contactName, exchangedName = exchangedName)
-                dao.insertPeer(peer)
-                
+                val existing = dao.getPeer(peerDeviceId)
+                if (existing == null) {
+                    dao.insertPeer(PeerEntity(peerDeviceId, peerPubKey, contactName, exchangedName = exchangedName))
+                } else {
+                    // Re-scan: update in place, so chat history, nickname and pin are kept
+                    // (re-inserting would delete the contact row and cascade-delete its messages)
+                    val keyChanged = existing.publicKeyBase64 != peerPubKey
+                    // Hold both of the contact's locks so no send or receive uses the old key meanwhile
+                    receiveLocks.getOrPut(peerDeviceId) { Mutex() }.withLock {
+                        sender.lockFor(peerDeviceId).withLock {
+                            dao.updatePeerIdentity(peerDeviceId, peerPubKey, contactName, exchangedName)
+                            if (keyChanged) {
+                                // New key = new shared secret and nonce space: drop the cached
+                                // cipher and start counters fresh. Messages are kept.
+                                sessionCiphers.remove(peerDeviceId)
+                                dao.resetSessionState(peerDeviceId)
+                            }
+                        }
+                    }
+                }
+
                 val state = dao.getSessionState(peerDeviceId)
                 if (state == null) {
                     dao.insertSessionState(SessionStateEntity(peerDeviceId))
@@ -269,10 +273,8 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateNickname(peerId: String, newNickname: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            val peer = dao.getPeer(peerId)
-            if (peer != null) {
-                dao.insertPeer(peer.copy(nickname = newNickname))
-            }
+            // An in-place UPDATE: re-inserting the contact would cascade-delete its messages
+            dao.updatePeerNickname(peerId, newNickname)
         }
     }
 
@@ -322,8 +324,8 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             val contentResolver = app.contentResolver
             val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-            val fileName = getFileName(uri) ?: "file"
-            val fileSize = getFileSize(uri)
+            val fileName = fileTransferManager.getFileName(uri) ?: "file"
+            val fileSize = fileTransferManager.getFileSize(uri)
 
             val messageType = when {
                 mimeType.startsWith("image/") -> "IMAGE"
@@ -570,27 +572,5 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch(Dispatchers.IO) {
             dao.updatePeerPinned(peerId, isPinned)
         }
-    }
-
-    // ─── File helpers ──────────────────────────────────────────────────
-
-    private fun getFileName(uri: Uri): String? {
-        app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val nameIndex = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
-            if (cursor.moveToFirst() && nameIndex >= 0) {
-                return cursor.getString(nameIndex)
-            }
-        }
-        return uri.lastPathSegment
-    }
-
-    private fun getFileSize(uri: Uri): Long? {
-        app.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-            val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
-            if (cursor.moveToFirst() && sizeIndex >= 0) {
-                return cursor.getLong(sizeIndex)
-            }
-        }
-        return null
     }
 }

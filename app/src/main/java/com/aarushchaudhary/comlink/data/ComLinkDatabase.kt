@@ -80,8 +80,17 @@ data class MessageEntity(
 @Dao
 interface ComLinkDao {
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // IGNORE, never REPLACE: SQLite's REPLACE deletes the row first, and the messages
+    // foreign key (onDelete = CASCADE) would then wipe the whole chat. Change existing
+    // contacts with the UPDATE queries below.
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertPeer(peer: PeerEntity)
+
+    @Query("UPDATE peers SET nickname = :nickname WHERE deviceId = :deviceId")
+    suspend fun updatePeerNickname(deviceId: String, nickname: String?)
+
+    @Query("UPDATE peers SET publicKeyBase64 = :publicKeyBase64, contactName = :contactName, exchangedName = :exchangedName WHERE deviceId = :deviceId")
+    suspend fun updatePeerIdentity(deviceId: String, publicKeyBase64: String, contactName: String, exchangedName: String)
 
     @Query("SELECT * FROM peers")
     fun getAllPeers(): Flow<List<PeerEntity>>
@@ -103,6 +112,10 @@ interface ComLinkDao {
 
     @Query("SELECT * FROM session_states WHERE deviceId = :deviceId LIMIT 1")
     suspend fun getSessionState(deviceId: String): SessionStateEntity?
+
+    /** Fresh counters for a contact whose key changed (a new key means a new nonce space). */
+    @Query("UPDATE session_states SET myNextCounter = 0, peerHighestCounter = -1, peerSeenWindow = NULL WHERE deviceId = :deviceId")
+    suspend fun resetSessionState(deviceId: String)
 
     @Query("UPDATE session_states SET myNextCounter = :counter WHERE deviceId = :deviceId")
     suspend fun updateMyCounter(deviceId: String, counter: Int)
@@ -150,6 +163,10 @@ interface ComLinkDao {
     @Query("SELECT * FROM file_transfers WHERE transferId = :transferId LIMIT 1")
     suspend fun getFileTransfer(transferId: String): FileTransferEntity?
 
+    /** For files sent before transfer ID = message ID, when the two IDs still differ. */
+    @Query("SELECT * FROM file_transfers WHERE messageId = :messageId AND isOutgoing = 1 LIMIT 1")
+    suspend fun getOutgoingTransferByMessageId(messageId: String): FileTransferEntity?
+
     @Query("UPDATE file_transfers SET receivedParts = receivedParts + 1 WHERE transferId = :transferId")
     suspend fun incrementReceivedParts(transferId: String)
 
@@ -161,6 +178,10 @@ interface ComLinkDao {
 
     @Query("UPDATE messages SET filePath = :path, transferProgress = 1.0, status = :status WHERE messageId = :messageId")
     suspend fun completeFileMessage(messageId: String, path: String, status: Int)
+
+    /** Sender side: the local copy exists, but progress stays as it is until the parts are out. */
+    @Query("UPDATE messages SET filePath = :path WHERE messageId = :messageId")
+    suspend fun setLocalFilePath(messageId: String, path: String)
 
     @Query("UPDATE messages SET transferProgress = :progress WHERE messageId = :messageId")
     suspend fun updateTransferProgress(messageId: String, progress: Float)

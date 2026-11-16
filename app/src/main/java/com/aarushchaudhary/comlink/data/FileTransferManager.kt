@@ -1,6 +1,6 @@
 package com.aarushchaudhary.comlink.data
 
-import android.content.ContentResolver
+import java.io.InputStream
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -15,7 +15,6 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.util.UUID
-import kotlin.math.ceil
 
 /**
  * Manages multi-envelope file transfers over the BLE mesh.
@@ -44,36 +43,44 @@ class FileTransferManager(
         private const val PROGRESS_UPDATE_INTERVAL = 5 // Update progress every N parts
     }
 
+    /** Outcome of [sendFile], so the caller can tell the user why a file didn't go out. */
+    enum class SendFileResult { SENT, TOO_LARGE, UNREADABLE, NOT_SENT }
+
+    private sealed class ReadResult {
+        class Ok(val bytes: ByteArray) : ReadResult()
+        object TooLarge : ReadResult()
+        object Unreadable : ReadResult()
+    }
+
     /**
-     * Send a file to a peer. Splits the file into parts and sends each as
-     * an encrypted envelope. Progress is updated in Room after each part.
+     * Send a file to a peer. The message and the transfer share one ID ([messageId]), the file is
+     * copied locally first, then a header and the parts go out (see [transmit]).
      */
     suspend fun sendFile(
         peerId: String,
         uri: Uri,
         messageId: String
-    ): Boolean {
+    ): SendFileResult {
         val contentResolver = context.contentResolver
         val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
-        val fileName = getFileName(contentResolver, uri) ?: "file"
-        var fileBytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: run {
-                Log.e(TAG, "Cannot read file: $uri")
-                return false
+        val fileName = getFileName(uri) ?: "file"
+        val transferId = messageId
+
+        val fileBytes = when (val read = readForSending(uri, mimeType)) {
+            is ReadResult.Ok -> read.bytes
+            ReadResult.TooLarge -> {
+                Log.e(TAG, "File too large to send: $uri (max $MAX_FILE_SIZE bytes)")
+                recordFailedTransfer(transferId, peerId, fileName, mimeType)
+                return SendFileResult.TOO_LARGE
             }
-
-        // Speed optimization: compress images before sending
-        if (mimeType.startsWith("image/")) {
-            fileBytes = compressImage(fileBytes)
+            ReadResult.Unreadable -> {
+                Log.e(TAG, "Cannot read file: $uri")
+                recordFailedTransfer(transferId, peerId, fileName, mimeType)
+                return SendFileResult.UNREADABLE
+            }
         }
 
-        if (fileBytes.size > MAX_FILE_SIZE) {
-            Log.e(TAG, "File too large: ${fileBytes.size} bytes (max $MAX_FILE_SIZE)")
-            return false
-        }
-
-        val transferId = UUID.randomUUID().toString()
-        val partCount = ceil(fileBytes.size.toDouble() / PART_SIZE).toInt().coerceAtLeast(1)
+        val partCount = TransferChecks.expectedPartCount(fileBytes.size.toLong())
 
         // Generate thumbnail for images
         val thumbnailBytes = if (mimeType.startsWith("image/")) {
@@ -81,7 +88,7 @@ class FileTransferManager(
         } else null
 
         // Save sender-side transfer record
-        dao.insertFileTransfer(FileTransferEntity(
+        val transfer = FileTransferEntity(
             transferId = transferId,
             messageId = messageId,
             peerDeviceId = peerId,
@@ -90,114 +97,106 @@ class FileTransferManager(
             fileSize = fileBytes.size.toLong(),
             partCount = partCount,
             isOutgoing = true
-        ))
+        )
+        dao.insertFileTransfer(transfer)
 
-        // Also save the file locally so the sender can view it
+        // Save the file locally so the sender can view it (and so jumpstart can re-read it).
+        // Progress stays below 1 until the parts are out, so a failed send can still be retried.
         val localFile = saveFileLocally(transferId, fileName, fileBytes)
-        dao.completeFileMessage(messageId, localFile.absolutePath, 0) // status stays WAIT until BLE confirms
+        dao.setLocalFilePath(messageId, localFile.absolutePath)
 
         if (thumbnailBytes != null) {
             val thumbPath = saveThumbnailLocally(transferId, thumbnailBytes)
             dao.updateThumbnailPath(messageId, thumbPath)
         }
 
-        // Send FILE_HEADER envelope (use broadcast — small, needs reliability)
+        return if (transmit(transfer, localFile.absolutePath, startPart = 0, thumbnailBytes = thumbnailBytes)) {
+            SendFileResult.SENT
+        } else {
+            SendFileResult.NOT_SENT
+        }
+    }
+
+    /**
+     * Jumpstarts a stuck outgoing file: re-sends the header (the receiver ignores a repeat, so parts
+     * it already has still count), then the parts from where sending stopped. If every part was
+     * already sent, all of them go again; the receiver skips the ones it holds.
+     */
+    suspend fun resumeOutgoingTransfer(peerId: String, message: MessageEntity) {
+        val filePath = message.filePath ?: return
+        val file = File(filePath)
+        if (!file.exists()) return
+
+        // New transfers use the message ID; files sent before that fix are found by message ID
+        val transfer = message.fileTransferId?.let { dao.getFileTransfer(it) }?.takeIf { it.isOutgoing }
+            ?: dao.getOutgoingTransferByMessageId(message.messageId)
+            ?: FileTransferEntity(
+                // No record at all: rebuild one from the message and the local copy
+                transferId = message.fileTransferId ?: message.messageId,
+                messageId = message.messageId,
+                peerDeviceId = peerId,
+                fileName = message.fileName ?: file.name,
+                mimeType = message.fileMimeType ?: "application/octet-stream",
+                fileSize = file.length(),
+                partCount = TransferChecks.expectedPartCount(file.length()),
+                isOutgoing = true
+            ).also { dao.insertFileTransfer(it) }
+
+        val startPart = if (transfer.lastSentPartIndex in 1 until transfer.partCount) transfer.lastSentPartIndex else 0
+        val thumbnailBytes = message.thumbnailPath?.let { File(it) }
+            ?.takeIf { it.exists() && it.length() <= TransferChecks.MAX_THUMBNAIL_BYTES }
+            ?.readBytes()
+
+        Log.i(TAG, "Jumpstarting transfer ${transfer.transferId} from part $startPart of ${transfer.partCount}")
+        transmit(transfer, filePath, startPart, thumbnailBytes)
+    }
+
+    /**
+     * Sends the header, then parts [startPart] until the end, read from the local copy at [filePath].
+     * Used by both a fresh send and a jumpstart. Returns true when every part went out.
+     */
+    private suspend fun transmit(
+        transfer: FileTransferEntity,
+        filePath: String,
+        startPart: Int,
+        thumbnailBytes: ByteArray?
+    ): Boolean {
+        val transferId = transfer.transferId
+        val peerId = transfer.peerDeviceId
+        val partCount = transfer.partCount
+        dao.updateTransferStatus(transferId, "IN_PROGRESS")
+
         val header = FileHeader(
             transfer_id = transferId,
-            file_name = fileName,
-            mime_type = mimeType,
-            file_size = fileBytes.size.toLong(),
+            file_name = transfer.fileName,
+            mime_type = transfer.mimeType,
+            file_size = transfer.fileSize,
             part_count = partCount,
             thumbnail = thumbnailBytes?.let { okio.ByteString.of(*it) } ?: okio.ByteString.EMPTY,
-            message_id = messageId
+            message_id = transfer.messageId
         )
-
-        val headerSent = sender.send(peerId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)
-        if (!headerSent) {
+        if (!sender.send(peerId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)) {
             Log.e(TAG, "Failed to send FILE_HEADER for transfer $transferId")
             dao.updateTransferStatus(transferId, "FAILED")
             return false
         }
 
         // Reserve counters upfront for all parts to avoid per-part lock acquisition
-        val counters = sender.reserveCounters(peerId, partCount) ?: run {
+        val remainingParts = partCount - startPart
+        val counters = sender.reserveCounters(peerId, remainingParts) ?: run {
             Log.e(TAG, "Failed to reserve counters for transfer $transferId")
             dao.updateTransferStatus(transferId, "FAILED")
             return false
         }
 
-        // Send FILE_PART envelopes sequentially — direct + no-response for speed
-        for (i in 0 until partCount) {
-            val start = i * PART_SIZE
-            val end = minOf(start + PART_SIZE, fileBytes.size)
-            val partData = fileBytes.copyOfRange(start, end)
-
-            val part = FilePart(
-                transfer_id = transferId,
-                part_index = i,
-                data_ = okio.ByteString.of(*partData)
-            )
-
-            val partSent = sender.sendReserved(peerId, part.encode(), counters[i], CONTENT_TYPE_FILE_PART)
-
-            if (!partSent) {
-                Log.e(TAG, "Failed to send FILE_PART $i/$partCount for transfer $transferId")
-                dao.updateTransferStatus(transferId, "FAILED")
-                dao.updateLastSentPartIndex(transferId, i)
-                return false
-            }
-
-            // Track last sent part index
-            dao.updateLastSentPartIndex(transferId, i + 1)
-
-            // Update progress in the message (batched — every N parts or last part)
-            if (i % PROGRESS_UPDATE_INTERVAL == 0 || i == partCount - 1) {
-                val progress = (i + 1).toFloat() / partCount
-                dao.updateTransferProgress(messageId, progress)
-            }
-        }
-
-        dao.updateTransferStatus(transferId, "COMPLETE")
-        dao.updateMessageStatus(messageId, 1) // SENT
-        return true
-    }
-
-    /**
-     * Jumpstarts / resumes a stopped or stuck outgoing file transfer.
-     * Uses RandomAccessFile to only read the parts that need resending.
-     */
-    suspend fun resumeOutgoingTransfer(
-        transferId: String,
-        peerId: String,
-        messageId: String,
-        filePath: String,
-        partCount: Int,
-        startPart: Int
-    ) {
-        val remainingParts = partCount - startPart
-        if (remainingParts <= 0) {
-            dao.updateTransferStatus(transferId, "COMPLETE")
-            dao.updateMessageStatus(messageId, 1)
-            return
-        }
-
-        Log.i(TAG, "Jumpstarting transfer $transferId from part $startPart ($remainingParts remaining)")
-        dao.updateTransferStatus(transferId, "IN_PROGRESS")
-
-        // Reserve counters upfront for all remaining parts
-        val counters = sender.reserveCounters(peerId, remainingParts) ?: run {
-            Log.e(TAG, "Jumpstart failed to reserve counters for $transferId")
-            dao.updateTransferStatus(transferId, "FAILED")
-            return
-        }
-
         val raf = try { RandomAccessFile(filePath, "r") } catch (e: Exception) {
-            Log.e(TAG, "Cannot open file for jumpstart: $filePath", e)
+            Log.e(TAG, "Cannot open local copy for transfer $transferId: $filePath", e)
             dao.updateTransferStatus(transferId, "FAILED")
-            return
+            return false
         }
 
-        try {
+        raf.use {
+            // Send FILE_PART envelopes sequentially — direct + no-response for speed
             for (i in startPart until partCount) {
                 val start = i.toLong() * PART_SIZE
                 val end = minOf(start + PART_SIZE, raf.length())
@@ -212,28 +211,78 @@ class FileTransferManager(
                 )
 
                 val counterIdx = i - startPart
-                val partSent = sender.sendReserved(peerId, part.encode(), counters[counterIdx], CONTENT_TYPE_FILE_PART)
-
-                if (!partSent) {
-                    Log.e(TAG, "Jumpstart failed to send FILE_PART $i/$partCount for transfer $transferId")
+                if (!sender.sendReserved(peerId, part.encode(), counters[counterIdx], CONTENT_TYPE_FILE_PART)) {
+                    Log.e(TAG, "Failed to send FILE_PART $i/$partCount for transfer $transferId")
                     dao.updateTransferStatus(transferId, "FAILED")
                     dao.updateLastSentPartIndex(transferId, i)
-                    return
+                    return false
                 }
 
+                // Track last sent part index
                 dao.updateLastSentPartIndex(transferId, i + 1)
 
+                // Update progress in the message (batched — every N parts or last part)
                 if (counterIdx % PROGRESS_UPDATE_INTERVAL == 0 || i == partCount - 1) {
-                    val progress = (i + 1).toFloat() / partCount
-                    dao.updateTransferProgress(messageId, progress)
+                    dao.updateTransferProgress(transfer.messageId, (i + 1).toFloat() / partCount)
                 }
             }
-
-            dao.updateTransferStatus(transferId, "COMPLETE")
-            dao.updateMessageStatus(messageId, 1) // SENT
-        } finally {
-            raf.close()
         }
+
+        dao.updateTransferStatus(transferId, "COMPLETE")
+        dao.updateMessageStatus(transfer.messageId, 1) // SENT
+        return true
+    }
+
+    /** A transfer that never started (too large or unreadable), recorded so it shows as failed. */
+    private suspend fun recordFailedTransfer(transferId: String, peerId: String, fileName: String, mimeType: String) {
+        dao.insertFileTransfer(FileTransferEntity(
+            transferId = transferId,
+            messageId = transferId,
+            peerDeviceId = peerId,
+            fileName = fileName,
+            mimeType = mimeType,
+            fileSize = 0,
+            partCount = 0,
+            isOutgoing = true,
+            status = "FAILED"
+        ))
+    }
+
+    /**
+     * Reads the bytes to send without ever loading more than [MAX_FILE_SIZE] + 1 bytes.
+     * Images are shrunk straight from the stream; anything that can't be decoded as an image is
+     * sent as a plain file, as before.
+     */
+    private fun readForSending(uri: Uri, mimeType: String): ReadResult {
+        if (mimeType.startsWith("image/")) {
+            compressImage(uri)?.let { jpeg ->
+                return if (jpeg.size > MAX_FILE_SIZE) ReadResult.TooLarge else ReadResult.Ok(jpeg)
+            }
+        }
+        val declaredSize = getFileSize(uri)
+        if (declaredSize != null && declaredSize > MAX_FILE_SIZE) return ReadResult.TooLarge
+
+        val bytes = try {
+            context.contentResolver.openInputStream(uri)?.use { readAtMost(it, MAX_FILE_SIZE + 1) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read $uri", e)
+            null
+        } ?: return ReadResult.Unreadable
+        return if (bytes.size > MAX_FILE_SIZE) ReadResult.TooLarge else ReadResult.Ok(bytes)
+    }
+
+    /** Reads at most [limit] bytes, so an unknown-size stream can't fill memory. */
+    private fun readAtMost(input: InputStream, limit: Long): ByteArray {
+        val out = ByteArrayOutputStream()
+        val buffer = ByteArray(64 * 1024)
+        var total = 0L
+        while (total < limit) {
+            val n = input.read(buffer, 0, minOf(buffer.size.toLong(), limit - total).toInt())
+            if (n < 0) break
+            out.write(buffer, 0, n)
+            total += n
+        }
+        return out.toByteArray()
     }
 
     /**
@@ -507,48 +556,67 @@ class FileTransferManager(
     }
 
     /**
-     * Compress an image to max 1920x1920 to significantly reduce file size and transfer time.
+     * Shrinks an image to at most 1920x1920 JPEG, reading straight from [uri] in two passes
+     * (size first, then a smaller decode), so a huge photo is never loaded whole.
+     * Returns null when it can't be decoded as an image (it's then sent as a plain file).
      */
-    private fun compressImage(imageBytes: ByteArray): ByteArray {
+    private fun compressImage(uri: Uri): ByteArray? {
+        val resolver = context.contentResolver
         return try {
-            val options = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
-            
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            // A bounds-only decode returns no bitmap, just fills in outWidth/outHeight
+            val opened = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds); true }
+            if (opened != true || bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
             var sampleSize = 1
-            while (options.outWidth / sampleSize > 1920 || options.outHeight / sampleSize > 1920) {
+            while (bounds.outWidth / sampleSize > 1920 || bounds.outHeight / sampleSize > 1920) {
                 sampleSize *= 2
             }
-            
+
             val decodeOptions = BitmapFactory.Options().apply { inSampleSize = sampleSize }
-            val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, decodeOptions) 
-                ?: return imageBytes // fallback
-                
+            val bitmap = resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, decodeOptions) }
+                ?: return null
+
             val scale = minOf(1920f / bitmap.width, 1920f / bitmap.height).coerceAtMost(1f)
             val finalW = (bitmap.width * scale).toInt().coerceAtLeast(1)
             val finalH = (bitmap.height * scale).toInt().coerceAtLeast(1)
-            
+
             val scaled = if (scale < 1f) Bitmap.createScaledBitmap(bitmap, finalW, finalH, true) else bitmap
             val out = ByteArrayOutputStream()
             scaled.compress(Bitmap.CompressFormat.JPEG, 75, out)
-            
+
             if (scaled !== bitmap) scaled.recycle()
             bitmap.recycle()
-            
+
             out.toByteArray()
         } catch (e: Exception) {
             Log.e(TAG, "Image compression failed", e)
-            imageBytes
+            null
+        } catch (e: OutOfMemoryError) {
+            Log.e(TAG, "Image too large to compress", e)
+            null
         }
     }
 
-    private fun getFileName(contentResolver: ContentResolver, uri: Uri): String? {
-        contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+    fun getFileName(uri: Uri): String? {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
             val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
             if (cursor.moveToFirst() && nameIndex >= 0) {
                 return cursor.getString(nameIndex)
             }
         }
         return uri.lastPathSegment
+    }
+
+    /** Size the provider reports for [uri], or null when it doesn't say. */
+    fun getFileSize(uri: Uri): Long? {
+        context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+            val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+            if (cursor.moveToFirst() && sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                return cursor.getLong(sizeIndex)
+            }
+        }
+        return null
     }
 
     private fun sanitizeFileName(name: String): String {
