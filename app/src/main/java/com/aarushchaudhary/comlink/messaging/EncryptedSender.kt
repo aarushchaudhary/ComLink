@@ -7,6 +7,7 @@ import kotlinx.coroutines.sync.withLock
 import okio.ByteString.Companion.toByteString
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.random.Random
 
 /**
  * The single place where outgoing envelopes are encrypted and built.
@@ -28,7 +29,19 @@ class EncryptedSender(
     private val transmit: suspend (envelope: Envelope, direct: Boolean, noResponse: Boolean) -> Boolean
 ) {
     companion object {
-        const val DEFAULT_TTL = 10
+        /** Hops a new envelope may make at most (relays also cap at this, see MeshRouter). */
+        const val MAX_TTL = 10
+
+        /** Fresh envelopes start at a random 8..10 hops, so the hops left don't reveal the sender's distance. */
+        const val MIN_START_TTL = 8
+
+        /**
+         * Highest counter ever used. The nonce holds 24 bits (16,777,216 values); stopping a little
+         * short means a counter, and with it a nonce, is never reused. Years of normal use.
+         */
+        const val MAX_COUNTER = 16_700_000
+
+        fun randomStartTtl(): Int = Random.nextInt(MIN_START_TTL, MAX_TTL + 1)
     }
 
     private val locks = ConcurrentHashMap<String, Mutex>()
@@ -48,21 +61,24 @@ class EncryptedSender(
         envelopeId: String = UUID.randomUUID().toString(),
         timestamp: Long = System.currentTimeMillis(),
         direct: Boolean = false,
-        noResponse: Boolean = false
+        noResponse: Boolean = false,
+        ttl: Int = randomStartTtl()
     ): Boolean = lockFor(peerId).withLock {
         val counter = loadCounter(peerId) ?: return@withLock false
+        if (counter >= MAX_COUNTER) return@withLock false // never wrap the 24-bit nonce counter
         val cipher = cipherFor(peerId) ?: return@withLock false
         saveCounter(peerId, counter + 1)
         // Sent while holding the lock, so envelopes leave in counter order
-        transmit(seal(peerId, cipher, plaintext, counter, contentType, envelopeId, timestamp), direct, noResponse)
+        transmit(seal(peerId, cipher, plaintext, counter, contentType, envelopeId, timestamp, ttl), direct, noResponse)
     }
 
     /**
      * Reserves [count] consecutive counters in one lock acquisition (used for file parts).
-     * Returns null when there's no session.
+     * Returns null when there's no session, or when the counters would pass [MAX_COUNTER].
      */
     suspend fun reserveCounters(peerId: String, count: Int): IntArray? = lockFor(peerId).withLock {
         val start = loadCounter(peerId) ?: return@withLock null
+        if (start.toLong() + count > MAX_COUNTER) return@withLock null
         saveCounter(peerId, start + count)
         IntArray(count) { start + it }
     }
@@ -77,7 +93,7 @@ class EncryptedSender(
         noResponse: Boolean = true
     ): Boolean {
         val cipher = cipherFor(peerId) ?: return false
-        val envelope = seal(peerId, cipher, plaintext, counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis())
+        val envelope = seal(peerId, cipher, plaintext, counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis(), randomStartTtl())
         return transmit(envelope, direct, noResponse)
     }
 
@@ -88,18 +104,20 @@ class EncryptedSender(
         counter: Int,
         contentType: Int,
         envelopeId: String,
-        timestamp: Long
+        timestamp: Long,
+        ttl: Int
     ): Envelope {
         // Header fields are bound to the ciphertext: a relay that changes any of them breaks decryption
         val aad = SessionCipher.envelopeAad(localDeviceId, peerId, envelopeId, contentType, timestamp)
+        // Padded to a size bucket first, so relays can't tell messages apart by length
         return Envelope(
             sender_id = localDeviceId,
             recipient_id = peerId,
-            ciphertext = cipher.encrypt(plaintext, counter, aad).toByteString(),
+            ciphertext = cipher.encrypt(Padding.pad(plaintext), counter, aad).toByteString(),
             nonce = cipher.constructNonce(counter).toByteString(),
             timestamp = timestamp,
             envelope_id = envelopeId,
-            ttl = DEFAULT_TTL,
+            ttl = ttl,
             content_type = contentType
         )
     }

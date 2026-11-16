@@ -32,6 +32,16 @@ class MessagingEngine(
 
     companion object {
         const val SAVED_MESSAGES_ID = "__SAVED__"
+
+        /** PRESENCE goes to every nearby contact this often. */
+        private const val PRESENCE_INTERVAL_MS = 30_000L
+        /** A contact is offline after this long without a PRESENCE (2.5 intervals, so one loss is OK). */
+        private const val OFFLINE_AFTER_MS = 75_000L
+        /** A HELLO/PING within this window counts as "nearby". */
+        private const val NEARBY_WINDOW_MS = 60_000L
+        /** At most one PRESENCE per contact per this long, however many HELLO/PINGs arrive. */
+        private const val PRESENCE_MIN_GAP_MS = 20_000L
+        private val PRESENCE_PAYLOAD = "PRESENCE".toByteArray(Charsets.UTF_8)
     }
 
     private val dao = app.database.comLinkDao()
@@ -46,6 +56,12 @@ class MessagingEngine(
     // Incoming envelopes are handled one at a time per contact. A separate lock from the
     // sender's, so a slow Bluetooth send never delays reading what that contact sends us.
     private val receiveLocks = ConcurrentHashMap<String, Mutex>()
+
+    // Contact -> last time a neighbour claimed to be them (HELLO/PING). Untrusted; only decides
+    // who gets a PRESENCE. Known contacts only, so it can't grow without bound.
+    private val nearbySeenAt = ConcurrentHashMap<String, Long>()
+    // Contact -> last time we sent them a PRESENCE
+    private val presenceSentAt = ConcurrentHashMap<String, Long>()
 
     private suspend fun getOrCreateCipher(peerId: String): SessionCipher? {
         return sessionCiphers.getOrPut(peerId) {
@@ -71,21 +87,24 @@ class MessagingEngine(
     val fileTransferManager = FileTransferManager(
         context = app,
         dao = dao,
-        sender = sender
+        sender = sender,
+        scope = scope
     )
 
     init {
         // Wired once for the whole app process, not per screen: a closed screen can no longer
         // swallow incoming messages
-        router.onMessageReceived = { envelope ->
-            processIncomingEnvelope(envelope)
+        router.onMessageReceived = { envelope, fromAddress ->
+            processIncomingEnvelope(envelope, fromAddress)
         }
         
-        app.bluetoothService.onPeerConnected = { peerId ->
+        // A HELLO/PING is only a claim: answer with our PRESENCE. The contact shows online only
+        // once *their* PRESENCE decrypts (handlePresence).
+        app.bluetoothService.onPeerSeen = { peerId ->
             scope.launch(Dispatchers.IO) {
-                dao.updatePeerConnectedStatus(peerId, true)
-                dao.updatePeerLastSeen(peerId, System.currentTimeMillis())
-                resendPendingMessages(peerId)
+                if (dao.getPeer(peerId) == null) return@launch
+                nearbySeenAt[peerId] = System.currentTimeMillis()
+                sendPresence(peerId)
             }
         }
         
@@ -103,9 +122,21 @@ class MessagingEngine(
                 val connectedPeers = dao.getConnectedPeers()
                 val now = System.currentTimeMillis()
                 for (peer in connectedPeers) {
-                    if (now - peer.lastSeenTimestamp > 45000) {
+                    if (now - peer.lastSeenTimestamp > OFFLINE_AFTER_MS) {
                         dao.updatePeerConnectedStatus(peer.deviceId, false)
                     }
+                }
+            }
+        }
+
+        // Presence: every 30 s, a PRESENCE to each contact seen nearby in the last minute
+        scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                kotlinx.coroutines.delay(PRESENCE_INTERVAL_MS)
+                val now = System.currentTimeMillis()
+                for ((peerId, seenAt) in nearbySeenAt.entries.toList()) {
+                    if (now - seenAt > NEARBY_WINDOW_MS) nearbySeenAt.remove(peerId, seenAt)
+                    else sendPresence(peerId, force = true)
                 }
             }
         }
@@ -152,7 +183,7 @@ class MessagingEngine(
     fun retryMessage(peerId: String, msg: com.aarushchaudhary.comlink.data.MessageEntity) {
         if (!msg.isFromMe) return
         // Allow retry for stuck text (status 0) or stuck file transfers (progress < 1)
-        val isStuckFile = msg.fileTransferId != null && msg.transferProgress < 1f
+        val isStuckFile = msg.fileTransferId != null && (msg.transferProgress < 1f || msg.status == 0)
         val isStuckText = msg.status == 0 && msg.fileTransferId == null
         if (!isStuckFile && !isStuckText) return
         
@@ -338,19 +369,19 @@ class MessagingEngine(
         }
     }
 
-    private fun processIncomingEnvelope(envelope: Envelope) {
+    private fun processIncomingEnvelope(envelope: Envelope, fromAddress: String) {
         scope.launch(Dispatchers.IO) {
             val senderId = envelope.sender_id ?: return@launch
             // Only known contacts get a lock, so random sender IDs can't grow the lock map
             dao.getPeer(senderId) ?: return@launch
             // One envelope at a time per contact: the replay window and file assembly never race
             receiveLocks.getOrPut(senderId) { Mutex() }.withLock {
-                handleIncomingEnvelope(senderId, envelope)
+                handleIncomingEnvelope(senderId, envelope, fromAddress)
             }
         }
     }
 
-    private suspend fun handleIncomingEnvelope(senderId: String, envelope: Envelope) {
+    private suspend fun handleIncomingEnvelope(senderId: String, envelope: Envelope, fromAddress: String) {
             val state = dao.getSessionState(senderId) ?: return
 
             val cipher = getOrCreateCipher(senderId) ?: return
@@ -364,7 +395,9 @@ class MessagingEngine(
                     envelope.sender_id, envelope.recipient_id, envelope.envelope_id,
                     envelope.content_type, envelope.timestamp
                 )
-                val (decryptedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes, aad)
+                val (paddedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes, aad)
+                // Strip the size-bucket padding (authenticated, so a bad length means a broken sender)
+                val decryptedBytes = Padding.unpad(paddedBytes) ?: return
 
                 // Replay protection: accept new counters and unseen ones inside the last 256,
                 // so messages that arrive out of order through the mesh aren't dropped
@@ -385,6 +418,14 @@ class MessagingEngine(
                     }
                     FileTransferManager.CONTENT_TYPE_FILE_PART -> {
                         fileTransferManager.onFilePartReceived(senderId, decryptedBytes)
+                        return
+                    }
+                    FileTransferManager.CONTENT_TYPE_PRESENCE -> {
+                        handlePresence(senderId, fromAddress)
+                        return
+                    }
+                    FileTransferManager.CONTENT_TYPE_FILE_STATUS -> {
+                        fileTransferManager.onFileStatusReceived(senderId, decryptedBytes)
                         return
                     }
                 }
@@ -449,6 +490,32 @@ class MessagingEngine(
             } catch (e: Exception) {
                 e.printStackTrace() // Decryption failed
             }
+    }
+
+    /**
+     * Sends our encrypted PRESENCE (ttl 1: neighbours only). At most once per [PRESENCE_MIN_GAP_MS]
+     * per contact unless [force] (the 30 s loop).
+     */
+    private suspend fun sendPresence(peerId: String, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val last = presenceSentAt[peerId]
+        if (!force && last != null && now - last < PRESENCE_MIN_GAP_MS) return
+        presenceSentAt[peerId] = now
+        sender.send(peerId, PRESENCE_PAYLOAD, contentType = FileTransferManager.CONTENT_TYPE_PRESENCE, ttl = 1)
+    }
+
+    /**
+     * A contact's PRESENCE decrypted: they are really there, at [fromAddress]. Only now are they
+     * shown online and given direct sends, and their waiting messages go out.
+     */
+    private suspend fun handlePresence(peerId: String, fromAddress: String) {
+        app.bluetoothService.trustAddress(peerId, fromAddress)
+        nearbySeenAt[peerId] = System.currentTimeMillis()
+        dao.updatePeerConnectedStatus(peerId, true)
+        dao.updatePeerLastSeen(peerId, System.currentTimeMillis())
+        resendPendingMessages(peerId)
+        // Make sure they see us too, without waiting for the next loop
+        scope.launch(Dispatchers.IO) { sendPresence(peerId) }
     }
 
     private fun sendAck(peerId: String, messageId: String) {

@@ -14,8 +14,9 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
         const val MAX_TTL = 10
     }
 
-    // Listener for messages that are destined for this device
-    var onMessageReceived: ((Envelope) -> Unit)? = null
+    // Listener for messages that are destined for this device. [fromAddress] is the Bluetooth address
+    // of the neighbour that handed it over (for PRESENCE: the contact's own address).
+    var onMessageReceived: ((envelope: Envelope, fromAddress: String) -> Unit)? = null
     
     // Callback to physically broadcast an envelope to all active Bluetooth connections
     var broadcastToNetwork: (suspend (ByteArray) -> Boolean)? = null
@@ -34,8 +35,9 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
 
     /**
      * Called by the Bluetooth layer whenever a raw byte payload is received from any socket.
+     * [fromAddress] is the address of the neighbour it came from.
      */
-    fun onBytesReceived(payload: ByteArray) {
+    fun onBytesReceived(payload: ByteArray, fromAddress: String) {
         val envelope = try {
             Envelope.ADAPTER.decode(payload)
         } catch (e: Exception) {
@@ -54,7 +56,7 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
         // 2. Check if the message is for this device
         if (envelope.recipient_id == localDeviceId) {
             // Pass to crypto layer for decryption
-            onMessageReceived?.invoke(envelope)
+            onMessageReceived?.invoke(envelope, fromAddress)
         } else {
             // 3. Multi-hop Relay Logic
             // We never attempt to decrypt ciphertext if we are not the recipient

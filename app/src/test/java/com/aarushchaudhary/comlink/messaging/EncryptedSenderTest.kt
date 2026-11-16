@@ -83,7 +83,32 @@ class EncryptedSenderTest {
         assertEquals("id-1", e.envelope_id)
         assertEquals(123L, e.timestamp)
         assertEquals(1, e.content_type)
-        assertEquals(EncryptedSender.DEFAULT_TTL, e.ttl)
+        assertTrue("ttl ${e.ttl}", e.ttl in EncryptedSender.MIN_START_TTL..EncryptedSender.MAX_TTL)
+        // Padded to a bucket: 256 bytes + 16-byte GCM tag
+        assertEquals(256 + 16, e.ciphertext.size)
+    }
+
+    @Test
+    fun startTtlIsRandomWithinRangeAndPresenceUsesOne() = runBlocking {
+        val sender = newSender()
+        repeat(200) { sender.send(peer, "x".toByteArray()) }
+        val ttls = sent.map { it.ttl }.toSet()
+        assertEquals(setOf(8, 9, 10), ttls)
+        sent.clear()
+        sender.send(peer, "PRESENCE".toByteArray(), contentType = 3, ttl = 1)
+        assertEquals(1, sent.single().ttl)
+    }
+
+    @Test
+    fun counterLimitStopsSendingInsteadOfWrapping() = runBlocking {
+        counters[peer] = EncryptedSender.MAX_COUNTER
+        val sender = newSender()
+        assertFalse(sender.send(peer, "x".toByteArray()))
+        assertNull(sender.reserveCounters(peer, 1))
+        counters[peer] = EncryptedSender.MAX_COUNTER - 5
+        assertNull(sender.reserveCounters(peer, 6))        // would pass the limit
+        assertTrue(sender.reserveCounters(peer, 5) != null) // exactly up to it is fine
+        assertTrue(sent.isEmpty())
     }
 
     @Test
@@ -105,10 +130,10 @@ class EncryptedSenderTest {
         assertTrue(sender.send(peer, "hi bob".toByteArray(), contentType = 0))
         val e = sent.single()
 
-        fun open(env: Envelope) = bobFromAlice.decrypt(
+        fun open(env: Envelope) = Padding.unpad(bobFromAlice.decrypt(
             env.ciphertext.toByteArray(), env.nonce.toByteArray(),
             SessionCipher.envelopeAad(env.sender_id, env.recipient_id, env.envelope_id, env.content_type, env.timestamp)
-        ).first
+        ).first)!!
 
         assertEquals("hi bob", String(open(e)))
         // A relay may lower ttl: still fine
@@ -119,6 +144,20 @@ class EncryptedSenderTest {
             org.junit.Assert.fail("tampered content_type must not decrypt")
         } catch (expected: javax.crypto.AEADBadTagException) {
         }
+    }
+
+    @Test
+    fun paddedLargestFilePartStillFitsOneBlePacketSet() = runBlocking {
+        val sender = newSender()
+        val part = com.aarushchaudhary.comlink.proto.FilePart(
+            transfer_id = java.util.UUID.randomUUID().toString(),
+            part_index = 99,
+            data_ = okio.ByteString.of(*ByteArray(com.aarushchaudhary.comlink.data.TransferChecks.PART_SIZE))
+        )
+        assertTrue(sender.sendReserved(peer, part.encode(), counter = 7, contentType = 2))
+        val wireSize = sent.single().encode().size
+        // BluetoothService carries at most 255 pieces of 500 data bytes per payload
+        assertTrue("file part envelope is $wireSize bytes", wireSize <= 255 * 500)
     }
 
     @Test

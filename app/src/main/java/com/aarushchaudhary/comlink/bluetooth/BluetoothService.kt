@@ -18,9 +18,20 @@ class BluetoothService(
     private val meshRouter: MeshRouter,
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
 ) {
-    var onPeerConnected: ((String) -> Unit)? = null
+    /**
+     * A neighbour *claims* to be this contact (plain-text HELLO/PING, or a working heartbeat).
+     * Untrusted: anyone can send a HELLO. It only prompts a PRESENCE exchange; a contact is shown
+     * online, and gets direct sends, only after their encrypted PRESENCE decrypts (see [trustAddress]).
+     */
+    var onPeerSeen: ((String) -> Unit)? = null
     var onPeerDisconnected: ((String) -> Unit)? = null
-    private val macToPeerId = ConcurrentHashMap<String, String>()
+    // Claimed (HELLO/PING) and proven (PRESENCE) addresses per contact
+    private val addresses = PeerAddressBook()
+
+    /** Called once a PRESENCE from [peerId] decrypted on a write from [address]. */
+    fun trustAddress(peerId: String, address: String) {
+        addresses.trust(peerId, address)
+    }
     companion object {
         private const val TAG = "ComLinkBluetooth"
         // Same as BitChat
@@ -115,7 +126,7 @@ class BluetoothService(
             result?.device?.let { device ->
                 val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
                 if (serviceData != null) {
-                    macToPeerId[device.address] = String(serviceData)
+                    addresses.claim(device.address, String(serviceData))
                 }
                 if (!activeGatts.containsKey(device.address)) {
                     connectToDevice(device)
@@ -131,6 +142,7 @@ class BluetoothService(
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 Log.d(TAG, "Client disconnected from our server: ${device.address}")
                 assembler.forget(device.address)
+                addresses.forgetTrust(device.address)
             }
         }
 
@@ -172,7 +184,8 @@ class BluetoothService(
                 Log.d(TAG, "Disconnected from: $address")
                 val current = connectionFor(address, gatt)
                 if (current != null && activeGatts.remove(address, current)) {
-                    macToPeerId[address]?.let { onPeerDisconnected?.invoke(it) }
+                    addresses.forgetTrust(address)
+                    addresses.claimedPeerAt(address)?.let { onPeerDisconnected?.invoke(it) }
                 }
                 gatt.close()
             }
@@ -292,6 +305,7 @@ class BluetoothService(
         activeGatts.clear()
         pendingConnections.clear()
         assembler.clear()
+        addresses.clearTrust()
 
         gattServer?.close()
         gattServer = null
@@ -308,10 +322,11 @@ class BluetoothService(
                     Log.d(TAG, "Heartbeat failed for $address")
                     conn.gatt.disconnect()
                     if (activeGatts.remove(address, conn)) {
-                        macToPeerId[address]?.let { onPeerDisconnected?.invoke(it) }
+                        addresses.forgetTrust(address)
+                        addresses.claimedPeerAt(address)?.let { onPeerDisconnected?.invoke(it) }
                     }
                 } else {
-                    macToPeerId[address]?.let { onPeerConnected?.invoke(it) }
+                    addresses.claimedPeerAt(address)?.let { onPeerSeen?.invoke(it) }
                 }
             }
         }
@@ -336,19 +351,19 @@ class BluetoothService(
         val payloadStr = String(completePayload)
         if (payloadStr.startsWith("HELLO:")) {
             val peerId = payloadStr.substringAfter("HELLO:")
-            macToPeerId[device.address] = peerId
-            onPeerConnected?.invoke(peerId)
+            addresses.claim(device.address, peerId)
+            onPeerSeen?.invoke(peerId)
             return
         }
         if (payloadStr.startsWith("PING:")) {
             val peerId = payloadStr.substringAfter("PING:")
-            macToPeerId[device.address] = peerId
-            onPeerConnected?.invoke(peerId)
+            addresses.claim(device.address, peerId)
+            onPeerSeen?.invoke(peerId)
             return
         }
 
         // Pass complete envelope back to router
-        meshRouter.onBytesReceived(completePayload)
+        meshRouter.onBytesReceived(completePayload, device.address)
     }
 
     suspend fun broadcast(payload: ByteArray): Boolean {
@@ -371,11 +386,12 @@ class BluetoothService(
     /**
      * Send a payload directly to a specific peer by device ID, bypassing broadcast.
      * Uses no-response BLE writes for maximum throughput when [noResponse] is true.
+     * Only an address proven by that peer's PRESENCE is used, so a fake HELLO can't redirect
+     * someone's messages; until then this falls back to broadcast.
      */
     suspend fun sendDirect(peerId: String, payload: ByteArray, noResponse: Boolean = false): Boolean {
-        // Reverse lookup: find the MAC address for this peer device ID
-        val macAddress = macToPeerId.entries.firstOrNull { it.value == peerId }?.key
-            ?: return broadcast(payload) // Fallback to broadcast if peer MAC unknown
+        val macAddress = addresses.trustedAddressOf(peerId)
+            ?: return broadcast(payload) // Fallback to broadcast until the address is proven
         val connection = activeGatts[macAddress]
             ?: return broadcast(payload) // Fallback if connection lost
 

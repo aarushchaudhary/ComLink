@@ -10,6 +10,15 @@ import android.util.Log
 import com.aarushchaudhary.comlink.messaging.EncryptedSender
 import com.aarushchaudhary.comlink.proto.FileHeader
 import com.aarushchaudhary.comlink.proto.FilePart
+import com.aarushchaudhary.comlink.proto.FileStatus
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -28,7 +37,8 @@ import java.util.UUID
 class FileTransferManager(
     private val context: Context,
     private val dao: ComLinkDao,
-    private val sender: EncryptedSender
+    private val sender: EncryptedSender,
+    private val scope: CoroutineScope
 ) {
 
     companion object {
@@ -38,10 +48,28 @@ class FileTransferManager(
         const val CONTENT_TYPE_MESSAGE = 0
         const val CONTENT_TYPE_FILE_HEADER = 1
         const val CONTENT_TYPE_FILE_PART = 2
+        const val CONTENT_TYPE_PRESENCE = 3
+        const val CONTENT_TYPE_FILE_STATUS = 4
+
+        /** Sender: wait this long for the receiver's status before asking for it. */
+        private const val STATUS_WAIT_MS = 15_000L
+        /** Sender: wait this long for an answer to a status request. */
+        private const val REQUEST_WAIT_MS = 10_000L
+        /** Sender: resend rounds before a transfer is marked failed. */
+        private const val MAX_DELIVERY_ROUNDS = 5
+        /** Receiver: report status when no part has arrived for this long. */
+        private const val STALL_REPORT_MS = 10_000L
         const val THUMBNAIL_MAX_DIM = 128
         const val THUMBNAIL_QUALITY = 50
         private const val PROGRESS_UPDATE_INTERVAL = 5 // Update progress every N parts
     }
+
+    // Sender side: the latest FILE_STATUS per transfer we're waiting on, and transfers with a running loop
+    private val statusWaiters = ConcurrentHashMap<String, Channel<FileStatus>>()
+    private val activeTransfers = ConcurrentHashMap.newKeySet<String>()
+
+    // Receiver side: one "no part for a while" report timer per incoming transfer
+    private val stallTimers = ConcurrentHashMap<String, Job>()
 
     /** Outcome of [sendFile], so the caller can tell the user why a file didn't go out. */
     enum class SendFileResult { SENT, TOO_LARGE, UNREADABLE, NOT_SENT }
@@ -110,7 +138,10 @@ class FileTransferManager(
             dao.updateThumbnailPath(messageId, thumbPath)
         }
 
-        return if (transmit(transfer, localFile.absolutePath, startPart = 0, thumbnailBytes = thumbnailBytes)) {
+        val delivered = withActiveTransfer(transferId) {
+            transmit(transfer, localFile.absolutePath, startPart = 0, thumbnailBytes = thumbnailBytes)
+        }
+        return if (delivered) {
             SendFileResult.SENT
         } else {
             SendFileResult.NOT_SENT
@@ -118,9 +149,9 @@ class FileTransferManager(
     }
 
     /**
-     * Jumpstarts a stuck outgoing file: re-sends the header (the receiver ignores a repeat, so parts
-     * it already has still count), then the parts from where sending stopped. If every part was
-     * already sent, all of them go again; the receiver skips the ones it holds.
+     * Jumpstarts a stuck outgoing file. It first asks the receiver which parts it holds and sends
+     * only the missing ones. If the receiver doesn't answer, or never got the header, the header
+     * and the parts go again from where sending stopped (all of them if every part was sent).
      */
     suspend fun resumeOutgoingTransfer(peerId: String, message: MessageEntity) {
         val filePath = message.filePath ?: return
@@ -142,18 +173,44 @@ class FileTransferManager(
                 isOutgoing = true
             ).also { dao.insertFileTransfer(it) }
 
-        val startPart = if (transfer.lastSentPartIndex in 1 until transfer.partCount) transfer.lastSentPartIndex else 0
         val thumbnailBytes = message.thumbnailPath?.let { File(it) }
             ?.takeIf { it.exists() && it.length() <= TransferChecks.MAX_THUMBNAIL_BYTES }
             ?.readBytes()
 
-        Log.i(TAG, "Jumpstarting transfer ${transfer.transferId} from part $startPart of ${transfer.partCount}")
-        transmit(transfer, filePath, startPart, thumbnailBytes)
+        withActiveTransfer(transfer.transferId) {
+            dao.updateTransferStatus(transfer.transferId, "IN_PROGRESS")
+            // 1. Ask first: the receiver may already hold most of it, or all of it
+            requestStatus(transfer)
+            val status = awaitStatus(transfer.transferId, REQUEST_WAIT_MS)
+            when {
+                status?.complete == true -> {
+                    markDelivered(transfer)
+                    true
+                }
+                status != null && status.part_count > 0 -> {
+                    val missing = PartBitmap.missing(status.received.toByteArray(), transfer.partCount)
+                    Log.i(TAG, "Jumpstart ${transfer.transferId}: receiver is missing ${missing.size} of ${transfer.partCount} parts")
+                    if (!sendParts(transfer, filePath, missing, trackProgress = false)) {
+                        failDelivery(transfer)
+                        false
+                    } else {
+                        awaitDelivery(transfer, filePath, thumbnailBytes)
+                    }
+                }
+                else -> {
+                    // 2. No answer, or no header on their side: header + parts again
+                    val startPart = if (transfer.lastSentPartIndex in 1 until transfer.partCount) transfer.lastSentPartIndex else 0
+                    Log.i(TAG, "Jumpstart ${transfer.transferId}: no status, resending from part $startPart")
+                    transmit(transfer, filePath, startPart, thumbnailBytes)
+                }
+            }
+        }
     }
 
     /**
-     * Sends the header, then parts [startPart] until the end, read from the local copy at [filePath].
-     * Used by both a fresh send and a jumpstart. Returns true when every part went out.
+     * Sends the header, then parts [startPart] until the end from the local copy at [filePath],
+     * then waits for the receiver to confirm every part ([awaitDelivery]). Returns true once the
+     * receiver reports the file complete.
      */
     private suspend fun transmit(
         transfer: FileTransferEntity,
@@ -161,76 +218,160 @@ class FileTransferManager(
         startPart: Int,
         thumbnailBytes: ByteArray?
     ): Boolean {
-        val transferId = transfer.transferId
-        val peerId = transfer.peerDeviceId
-        val partCount = transfer.partCount
-        dao.updateTransferStatus(transferId, "IN_PROGRESS")
+        dao.updateTransferStatus(transfer.transferId, "IN_PROGRESS")
+        if (!sendHeader(transfer, thumbnailBytes) ||
+            !sendParts(transfer, filePath, (startPart until transfer.partCount).toList(), trackProgress = true)
+        ) {
+            failDelivery(transfer)
+            return false
+        }
+        // Every part went out: SENT. Delivered (2) only once the receiver confirms.
+        dao.raiseMessageStatus(transfer.messageId, 1)
+        return awaitDelivery(transfer, filePath, thumbnailBytes)
+    }
 
+    /**
+     * Waits for the receiver's FILE_STATUS and re-sends only what it is missing, for up to
+     * [MAX_DELIVERY_ROUNDS] rounds. No status in time means asking for one. A receiver that
+     * doesn't know the transfer gets the header and every part again.
+     */
+    private suspend fun awaitDelivery(transfer: FileTransferEntity, filePath: String, thumbnailBytes: ByteArray?): Boolean {
+        val transferId = transfer.transferId
+        repeat(MAX_DELIVERY_ROUNDS) { round ->
+            // Statuses that arrived while parts were still going out are stale, except "complete"
+            if (takeStaleStatus(transferId)?.complete == true) {
+                markDelivered(transfer)
+                return true
+            }
+            val status = awaitStatus(transferId, STATUS_WAIT_MS)
+                ?: run {
+                    requestStatus(transfer)
+                    awaitStatus(transferId, REQUEST_WAIT_MS)
+                }
+                ?: return@repeat // no answer this round
+
+            if (status.complete) {
+                markDelivered(transfer)
+                return true
+            }
+            val resendOk = if (status.part_count == 0) {
+                Log.i(TAG, "Transfer $transferId round ${round + 1}: receiver has no header, resending all")
+                sendHeader(transfer, thumbnailBytes) &&
+                    sendParts(transfer, filePath, (0 until transfer.partCount).toList(), trackProgress = false)
+            } else {
+                val missing = PartBitmap.missing(status.received.toByteArray(), transfer.partCount)
+                if (missing.isEmpty()) return@repeat // all parts there, the file is being assembled
+                Log.i(TAG, "Transfer $transferId round ${round + 1}: resending ${missing.size} missing parts")
+                sendParts(transfer, filePath, missing, trackProgress = false)
+            }
+            if (!resendOk) {
+                failDelivery(transfer)
+                return false
+            }
+        }
+        Log.w(TAG, "Transfer $transferId not confirmed after $MAX_DELIVERY_ROUNDS rounds")
+        failDelivery(transfer)
+        return false
+    }
+
+    private suspend fun sendHeader(transfer: FileTransferEntity, thumbnailBytes: ByteArray?): Boolean {
         val header = FileHeader(
-            transfer_id = transferId,
+            transfer_id = transfer.transferId,
             file_name = transfer.fileName,
             mime_type = transfer.mimeType,
             file_size = transfer.fileSize,
-            part_count = partCount,
+            part_count = transfer.partCount,
             thumbnail = thumbnailBytes?.let { okio.ByteString.of(*it) } ?: okio.ByteString.EMPTY,
             message_id = transfer.messageId
         )
-        if (!sender.send(peerId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)) {
-            Log.e(TAG, "Failed to send FILE_HEADER for transfer $transferId")
-            dao.updateTransferStatus(transferId, "FAILED")
-            return false
-        }
+        val sent = sender.send(transfer.peerDeviceId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)
+        if (!sent) Log.e(TAG, "Failed to send FILE_HEADER for transfer ${transfer.transferId}")
+        return sent
+    }
 
-        // Reserve counters upfront for all parts to avoid per-part lock acquisition
-        val remainingParts = partCount - startPart
-        val counters = sender.reserveCounters(peerId, remainingParts) ?: run {
+    /**
+     * Sends the listed parts from the local copy, direct + no-response for speed, with counters
+     * reserved in one go. [trackProgress] (first pass only) updates the resume point and progress bar.
+     */
+    private suspend fun sendParts(
+        transfer: FileTransferEntity,
+        filePath: String,
+        parts: List<Int>,
+        trackProgress: Boolean
+    ): Boolean {
+        if (parts.isEmpty()) return true
+        val transferId = transfer.transferId
+        val peerId = transfer.peerDeviceId
+        val partCount = transfer.partCount
+
+        val counters = sender.reserveCounters(peerId, parts.size) ?: run {
             Log.e(TAG, "Failed to reserve counters for transfer $transferId")
-            dao.updateTransferStatus(transferId, "FAILED")
             return false
         }
-
         val raf = try { RandomAccessFile(filePath, "r") } catch (e: Exception) {
             Log.e(TAG, "Cannot open local copy for transfer $transferId: $filePath", e)
-            dao.updateTransferStatus(transferId, "FAILED")
             return false
         }
-
         raf.use {
-            // Send FILE_PART envelopes sequentially — direct + no-response for speed
-            for (i in startPart until partCount) {
+            parts.forEachIndexed { n, i ->
                 val start = i.toLong() * PART_SIZE
                 val end = minOf(start + PART_SIZE, raf.length())
                 val partData = ByteArray((end - start).toInt())
                 raf.seek(start)
                 raf.readFully(partData)
 
-                val part = FilePart(
-                    transfer_id = transferId,
-                    part_index = i,
-                    data_ = okio.ByteString.of(*partData)
-                )
-
-                val counterIdx = i - startPart
-                if (!sender.sendReserved(peerId, part.encode(), counters[counterIdx], CONTENT_TYPE_FILE_PART)) {
+                val part = FilePart(transfer_id = transferId, part_index = i, data_ = okio.ByteString.of(*partData))
+                if (!sender.sendReserved(peerId, part.encode(), counters[n], CONTENT_TYPE_FILE_PART)) {
                     Log.e(TAG, "Failed to send FILE_PART $i/$partCount for transfer $transferId")
-                    dao.updateTransferStatus(transferId, "FAILED")
-                    dao.updateLastSentPartIndex(transferId, i)
+                    if (trackProgress) dao.updateLastSentPartIndex(transferId, i)
                     return false
                 }
-
-                // Track last sent part index
-                dao.updateLastSentPartIndex(transferId, i + 1)
-
-                // Update progress in the message (batched — every N parts or last part)
-                if (counterIdx % PROGRESS_UPDATE_INTERVAL == 0 || i == partCount - 1) {
-                    dao.updateTransferProgress(transfer.messageId, (i + 1).toFloat() / partCount)
+                if (trackProgress) {
+                    dao.updateLastSentPartIndex(transferId, i + 1)
+                    // Update progress in the message (batched — every N parts or last part)
+                    if (n % PROGRESS_UPDATE_INTERVAL == 0 || i == partCount - 1) {
+                        dao.updateTransferProgress(transfer.messageId, (i + 1).toFloat() / partCount)
+                    }
                 }
             }
         }
-
-        dao.updateTransferStatus(transferId, "COMPLETE")
-        dao.updateMessageStatus(transfer.messageId, 1) // SENT
         return true
+    }
+
+    private suspend fun requestStatus(transfer: FileTransferEntity) {
+        val request = FileStatus(transfer_id = transfer.transferId, request = true)
+        sender.send(transfer.peerDeviceId, request.encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+    }
+
+    private suspend fun markDelivered(transfer: FileTransferEntity) {
+        dao.updateTransferStatus(transfer.transferId, "COMPLETE")
+        dao.updateTransferProgress(transfer.messageId, 1f)
+        dao.raiseMessageStatus(transfer.messageId, 2) // Delivered (never lowers a Seen)
+    }
+
+    /** Not confirmed: back to WAIT (status 0), so the retry option shows up again. */
+    private suspend fun failDelivery(transfer: FileTransferEntity) {
+        dao.updateTransferStatus(transfer.transferId, "FAILED")
+        dao.updateMessageStatus(transfer.messageId, 0)
+    }
+
+    private fun waiterFor(transferId: String): Channel<FileStatus> =
+        statusWaiters.getOrPut(transferId) { Channel(Channel.CONFLATED) }
+
+    private suspend fun awaitStatus(transferId: String, timeoutMs: Long): FileStatus? =
+        withTimeoutOrNull(timeoutMs) { waiterFor(transferId).receive() }
+
+    private fun takeStaleStatus(transferId: String): FileStatus? = waiterFor(transferId).tryReceive().getOrNull()
+
+    /** One send/jumpstart loop per transfer at a time; a second tap while one runs does nothing. */
+    private suspend fun withActiveTransfer(transferId: String, block: suspend () -> Boolean): Boolean {
+        if (!activeTransfers.add(transferId)) return false
+        return try {
+            block()
+        } finally {
+            activeTransfers.remove(transferId)
+            statusWaiters.remove(transferId)
+        }
     }
 
     /** A transfer that never started (too large or unreadable), recorded so it shows as failed. */
@@ -313,6 +454,8 @@ class FileTransferManager(
                 Log.w(TAG, "Rejected FILE_HEADER from $senderId: transfer ID belongs to another transfer")
             } else {
                 getTransferTempDir(transferId).mkdirs()
+                // Tell the sender where we stand: done, or (if parts don't follow) what's missing
+                if (existingTransfer.status == "COMPLETE") reportStatus(existingTransfer) else armStallReport(existingTransfer)
             }
             return
         }
@@ -372,6 +515,8 @@ class FileTransferManager(
 
         // Create temp directory for parts
         getTransferTempDir(transferId).mkdirs()
+        // If no parts follow, report the (empty) status so the sender knows the header arrived
+        dao.getFileTransfer(transferId)?.let { armStallReport(it) }
     }
 
     /**
@@ -401,8 +546,12 @@ class FileTransferManager(
             Log.w(TAG, "Rejected FILE_PART from $senderId: transfer belongs to someone else")
             return
         }
-        // A late duplicate after assembly must not restart (and then fail) a finished file
-        if (transfer.status == "COMPLETE") return
+        // A late duplicate after assembly must not restart (and then fail) a finished file.
+        // The sender evidently missed our "complete" report, so send it again.
+        if (transfer.status == "COMPLETE") {
+            reportStatus(transfer)
+            return
+        }
 
         val partIndex = part.part_index
         val partBytes = part.data_.toByteArray()
@@ -433,7 +582,11 @@ class FileTransferManager(
 
         // Check if all parts received
         if (updatedTransfer.receivedParts >= updatedTransfer.partCount) {
+            stallTimers.remove(transferId)?.cancel()
             assembleFile(updatedTransfer)
+        } else {
+            // If the rest stops coming, tell the sender which parts are missing
+            armStallReport(updatedTransfer)
         }
     }
 
@@ -475,6 +628,8 @@ class FileTransferManager(
             // Update records
             dao.completeFileMessage(transfer.messageId, outputFile.absolutePath, 0)
             dao.updateTransferStatus(transfer.transferId, "COMPLETE")
+            // Confirm to the sender, so it can show Delivered and stop resending
+            reportStatus(transfer.copy(status = "COMPLETE"))
 
             Log.d(TAG, "File assembled: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
 
@@ -483,6 +638,75 @@ class FileTransferManager(
             dao.updateTransferStatus(transfer.transferId, "FAILED")
         }
     }
+
+    /**
+     * Handle an incoming FILE_STATUS. With `request` set it comes from a sender asking us (the
+     * receiver) for our status; otherwise it is a receiver reporting on a file we are sending.
+     */
+    suspend fun onFileStatusReceived(senderId: String, decryptedPayload: ByteArray) {
+        val status = try {
+            FileStatus.ADAPTER.decode(decryptedPayload)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to decode FileStatus", e)
+            return
+        }
+        val transferId = status.transfer_id
+        if (!TransferChecks.isCanonicalUuid(transferId)) return
+        val transfer = dao.getFileTransfer(transferId)
+
+        if (status.request) {
+            when {
+                // Never saw the header: say so (part_count 0), and the sender starts over
+                transfer == null -> scope.launch(Dispatchers.IO) {
+                    sender.send(senderId, FileStatus(transfer_id = transferId, part_count = 0).encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+                }
+                !transfer.isOutgoing && transfer.peerDeviceId == senderId -> reportStatus(transfer)
+                else -> Log.w(TAG, "Ignored status request from $senderId for a transfer that isn't theirs")
+            }
+            return
+        }
+
+        // A report about one of our outgoing transfers, from that transfer's receiver only
+        if (transfer == null || !transfer.isOutgoing || transfer.peerDeviceId != senderId) return
+        val waiter = statusWaiters[transferId]
+        if (waiter != null) {
+            waiter.trySend(status)
+        } else if (status.complete) {
+            // No loop waiting (it gave up, or the app restarted): a late "complete" still counts
+            markDelivered(transfer)
+        }
+    }
+
+    /** Sends our receiver-side status for [transfer]: which parts we hold, or that it is complete. */
+    private fun reportStatus(transfer: FileTransferEntity) {
+        scope.launch(Dispatchers.IO) {
+            val complete = transfer.status == "COMPLETE"
+            val held = if (complete) (0 until transfer.partCount).toList() else heldParts(transfer)
+            val status = FileStatus(
+                transfer_id = transfer.transferId,
+                part_count = transfer.partCount,
+                received = okio.ByteString.of(*PartBitmap.encode(transfer.partCount, held)),
+                complete = complete
+            )
+            sender.send(transfer.peerDeviceId, status.encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+        }
+    }
+
+    /** (Re)starts the "no part for [STALL_REPORT_MS]" timer that reports our status once. */
+    private fun armStallReport(transfer: FileTransferEntity) {
+        val transferId = transfer.transferId
+        stallTimers.remove(transferId)?.cancel()
+        stallTimers[transferId] = scope.launch(Dispatchers.IO) {
+            delay(STALL_REPORT_MS)
+            stallTimers.remove(transferId)
+            val current = dao.getFileTransfer(transferId) ?: return@launch
+            reportStatus(current)
+        }
+    }
+
+    /** Part indexes already on disk for an incoming transfer. */
+    private fun heldParts(transfer: FileTransferEntity): List<Int> =
+        (0 until transfer.partCount).filter { File(getTransferTempDir(transfer.transferId), "part_$it").exists() }
 
     // ─── Helpers ───────────────────────────────────────────────────────
 

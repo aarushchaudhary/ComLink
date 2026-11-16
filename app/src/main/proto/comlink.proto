@@ -14,6 +14,8 @@ message Envelope {
   // 0 = MESSAGE (text/ack/read receipt, default)
   // 1 = FILE_HEADER (metadata for file transfer)
   // 2 = FILE_PART (chunk of file data)
+  // 3 = PRESENCE (encrypted "I'm here", ttl 1; the only thing that marks a contact online)
+  // 4 = FILE_STATUS (which parts of a transfer the receiver holds, or a request for that)
   int32 content_type = 8;
 }
 
@@ -44,4 +46,14 @@ message FilePart {
   string transfer_id = 1;       // Links back to the FileHeader
   int32  part_index = 2;        // 0-based index of this part
   bytes  data = 3;              // File data payload (≤ 100 KB)
+}
+
+// Per-part delivery report for a transfer. Encrypted inside Envelope.ciphertext.
+// Receiver -> sender: which parts it holds. Sender -> receiver with request = true: "send me yours".
+message FileStatus {
+  string transfer_id = 1;
+  int32  part_count  = 2;       // 0 = the receiver doesn't know this transfer (no header yet)
+  bytes  received    = 3;       // Bitmap: bit i (byte i/8, bit i%8) = part i is held
+  bool   complete    = 4;       // All parts held and the file is assembled
+  bool   request     = 5;       // Sender asking the receiver to report its status
 }

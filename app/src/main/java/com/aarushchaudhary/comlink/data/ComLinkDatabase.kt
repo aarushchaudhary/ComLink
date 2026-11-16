@@ -149,6 +149,10 @@ interface ComLinkDao {
     @Query("UPDATE messages SET status = :status WHERE messageId = :messageId")
     suspend fun updateMessageStatus(messageId: String, status: Int)
 
+    /** Sets the status only if it is higher, so e.g. a late "Delivered" never undoes "Seen". */
+    @Query("UPDATE messages SET status = :status WHERE messageId = :messageId AND status < :status")
+    suspend fun raiseMessageStatus(messageId: String, status: Int)
+
     @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND isFromMe = 0 AND status = 0 ORDER BY timestamp ASC")
     suspend fun getUnreadMessages(deviceId: String): List<MessageEntity>
 
