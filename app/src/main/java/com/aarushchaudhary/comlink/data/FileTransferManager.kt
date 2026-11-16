@@ -34,8 +34,8 @@ class FileTransferManager(
 
     companion object {
         private const val TAG = "FileTransfer"
-        const val PART_SIZE = 100_000  // ~100 KB per part (stays within 128 KB BLE envelope limit)
-        const val MAX_FILE_SIZE = 10_000_000L  // 10 MB hard limit
+        const val PART_SIZE = TransferChecks.PART_SIZE  // ~100 KB per part (stays within 128 KB BLE envelope limit)
+        const val MAX_FILE_SIZE = TransferChecks.MAX_FILE_SIZE  // 10 MB hard limit
         const val CONTENT_TYPE_MESSAGE = 0
         const val CONTENT_TYPE_FILE_HEADER = 1
         const val CONTENT_TYPE_FILE_PART = 2
@@ -248,8 +248,32 @@ class FileTransferManager(
             return
         }
 
-        val transferId = header.transfer_id.takeIf { it.isNotEmpty() } ?: return
+        val transferId = header.transfer_id
         val messageId = header.message_id.takeIf { it.isNotEmpty() } ?: UUID.randomUUID().toString()
+        // These IDs become file paths and database keys: only well-formed headers are accepted
+        if (!TransferChecks.isValidHeader(transferId, messageId, header.file_size, header.part_count)) {
+            Log.w(TAG, "Rejected FILE_HEADER from $senderId: invalid ID, size or part count")
+            return
+        }
+
+        val existingTransfer = dao.getFileTransfer(transferId)
+        if (existingTransfer != null) {
+            // A repeated header for a transfer we already have (e.g. a jumpstart) changes nothing,
+            // so parts already received still count. Someone else's transfer ID is refused.
+            if (existingTransfer.isOutgoing || existingTransfer.peerDeviceId != senderId) {
+                Log.w(TAG, "Rejected FILE_HEADER from $senderId: transfer ID belongs to another transfer")
+            } else {
+                getTransferTempDir(transferId).mkdirs()
+            }
+            return
+        }
+        val existingMessage = dao.getMessage(messageId)
+        if (existingMessage != null) {
+            // The message ID is already used (another chat, or one of our own messages): never touch it
+            Log.w(TAG, "Rejected FILE_HEADER from $senderId: message ID already in use")
+            return
+        }
+
         val fileName = header.file_name.takeIf { it.isNotEmpty() } ?: "file"
         val mimeType = header.mime_type.takeIf { it.isNotEmpty() } ?: "application/octet-stream"
 
@@ -269,7 +293,7 @@ class FileTransferManager(
             fileName = fileName,
             mimeType = mimeType,
             fileSize = header.file_size,
-            partCount = header.part_count.coerceAtLeast(1),
+            partCount = header.part_count,
             isOutgoing = false
         ))
 
@@ -291,7 +315,8 @@ class FileTransferManager(
 
         // Save thumbnail if present
         val thumbBytes = header.thumbnail.toByteArray()
-        if (thumbBytes.isNotEmpty()) {
+        // An oversized thumbnail is skipped; the file itself still comes through
+        if (thumbBytes.isNotEmpty() && thumbBytes.size <= TransferChecks.MAX_THUMBNAIL_BYTES) {
             val thumbPath = saveThumbnailLocally(transferId, thumbBytes)
             dao.updateThumbnailPath(messageId, thumbPath)
         }
@@ -312,19 +337,34 @@ class FileTransferManager(
             return
         }
 
-        val transferId = part.transfer_id.takeIf { it.isNotEmpty() } ?: return
+        val transferId = part.transfer_id
+        if (!TransferChecks.isCanonicalUuid(transferId)) {
+            Log.w(TAG, "Rejected FILE_PART from $senderId: invalid transfer ID")
+            return
+        }
         val transfer = dao.getFileTransfer(transferId)
         if (transfer == null) {
             Log.w(TAG, "Received FILE_PART for unknown transfer: $transferId")
             return
         }
+        // Only the contact who sent the header may add parts, and never to our own outgoing transfer
+        if (transfer.isOutgoing || transfer.peerDeviceId != senderId) {
+            Log.w(TAG, "Rejected FILE_PART from $senderId: transfer belongs to someone else")
+            return
+        }
+        // A late duplicate after assembly must not restart (and then fail) a finished file
+        if (transfer.status == "COMPLETE") return
+
+        val partIndex = part.part_index
+        val partBytes = part.data_.toByteArray()
+        if (!TransferChecks.isValidPart(transferId, partIndex, transfer.partCount, partBytes.size)) {
+            Log.w(TAG, "Rejected FILE_PART $partIndex for $transferId: index or size out of range")
+            return
+        }
 
         // Write part to disk
-        val partIndex = part.part_index
         val partFile = File(getTransferTempDir(transferId), "part_$partIndex")
         partFile.parentFile?.mkdirs()
-        val partBytes = part.data_.toByteArray()
-        if (partBytes.isEmpty()) return
         val alreadyExisted = partFile.exists()
         partFile.writeBytes(partBytes)
 
@@ -370,6 +410,14 @@ class FileTransferManager(
                         return
                     }
                 }
+            }
+
+            // The parts must add up to exactly the size the header announced
+            if (outputFile.length() != transfer.fileSize) {
+                Log.e(TAG, "Size mismatch for ${transfer.transferId}: got ${outputFile.length()}, expected ${transfer.fileSize}")
+                outputFile.delete()
+                dao.updateTransferStatus(transfer.transferId, "FAILED")
+                return
             }
 
             // Clean up temp parts

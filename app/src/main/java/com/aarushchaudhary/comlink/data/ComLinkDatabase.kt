@@ -23,7 +23,9 @@ data class PeerEntity(
 data class SessionStateEntity(
     @PrimaryKey val deviceId: String,
     val myNextCounter: Int = 0,
-    val peerHighestCounter: Int = -1
+    val peerHighestCounter: Int = -1,
+    // ReplayWindow bits (32 bytes); null for sessions saved before v8
+    val peerSeenWindow: ByteArray? = null
 )
 
 @Entity(tableName = "file_transfers")
@@ -105,11 +107,14 @@ interface ComLinkDao {
     @Query("UPDATE session_states SET myNextCounter = :counter WHERE deviceId = :deviceId")
     suspend fun updateMyCounter(deviceId: String, counter: Int)
 
-    @Query("UPDATE session_states SET peerHighestCounter = :counter WHERE deviceId = :deviceId")
-    suspend fun updatePeerCounter(deviceId: String, counter: Int)
+    @Query("UPDATE session_states SET peerHighestCounter = :highest, peerSeenWindow = :window WHERE deviceId = :deviceId")
+    suspend fun updatePeerReplayState(deviceId: String, highest: Int, window: ByteArray)
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessage(message: MessageEntity)
+
+    @Query("SELECT * FROM messages WHERE messageId = :messageId LIMIT 1")
+    suspend fun getMessage(messageId: String): MessageEntity?
 
     @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND plaintext NOT LIKE 'ACK:%' ORDER BY timestamp ASC")
     fun getMessagesForPeer(deviceId: String): Flow<List<MessageEntity>>
@@ -166,14 +171,15 @@ interface ComLinkDao {
 
 @Database(
     entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class, FileTransferEntity::class], 
-    version = 7, 
+    version = 8,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3),
         AutoMigration(from = 3, to = 4),
         AutoMigration(from = 4, to = 5),
         AutoMigration(from = 5, to = 6),
-        AutoMigration(from = 6, to = 7)
+        AutoMigration(from = 6, to = 7),
+        AutoMigration(from = 7, to = 8)
     ]
 )
 abstract class ComLinkDatabase : RoomDatabase() {

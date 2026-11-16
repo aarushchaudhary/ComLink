@@ -6,6 +6,7 @@ import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aarushchaudhary.comlink.ComLinkApp
+import com.aarushchaudhary.comlink.crypto.ReplayWindow
 import com.aarushchaudhary.comlink.crypto.SessionCipher
 import com.aarushchaudhary.comlink.data.FileTransferManager
 import com.aarushchaudhary.comlink.data.MessageEntity
@@ -20,6 +21,8 @@ import kotlinx.coroutines.launch
 import java.util.UUID
 
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 class ComLinkViewModel(application: Application) : AndroidViewModel(application) {
@@ -39,6 +42,10 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
 
     // Contacts with a resend already running, so overlapping triggers don't run it twice
     private val resendInFlight = ConcurrentHashMap.newKeySet<String>()
+
+    // Incoming envelopes are handled one at a time per contact. A separate lock from the
+    // sender's, so a slow Bluetooth send never delays reading what that contact sends us.
+    private val receiveLocks = ConcurrentHashMap<String, Mutex>()
 
     private suspend fun getOrCreateCipher(peerId: String): SessionCipher? {
         return sessionCiphers.getOrPut(peerId) {
@@ -388,24 +395,33 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     private fun processIncomingEnvelope(envelope: Envelope) {
         viewModelScope.launch(Dispatchers.IO) {
             val senderId = envelope.sender_id ?: return@launch
-            val peer = dao.getPeer(senderId) ?: return@launch
-            val state = dao.getSessionState(senderId) ?: return@launch
-            
-            val cipher = getOrCreateCipher(senderId) ?: return@launch
-            
+            // Only known contacts get a lock, so random sender IDs can't grow the lock map
+            dao.getPeer(senderId) ?: return@launch
+            // One envelope at a time per contact: the replay window and file assembly never race
+            receiveLocks.getOrPut(senderId) { Mutex() }.withLock {
+                handleIncomingEnvelope(senderId, envelope)
+            }
+        }
+    }
+
+    private suspend fun handleIncomingEnvelope(senderId: String, envelope: Envelope) {
+            val state = dao.getSessionState(senderId) ?: return
+
+            val cipher = getOrCreateCipher(senderId) ?: return
+
             try {
-                val ciphertext = envelope.ciphertext?.toByteArray() ?: return@launch
-                val nonceBytes = envelope.nonce?.toByteArray() ?: return@launch
-                
+                val ciphertext = envelope.ciphertext?.toByteArray() ?: return
+                val nonceBytes = envelope.nonce?.toByteArray() ?: return
+
                 val (decryptedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes)
-                
-                // Ensure strictly monotonic counter to prevent replay attacks
-                if (counter <= state.peerHighestCounter) {
-                    // Replay attack or delayed message, drop it.
-                    return@launch
+
+                // Replay protection: accept new counters and unseen ones inside the last 256,
+                // so messages that arrive out of order through the mesh aren't dropped
+                val window = ReplayWindow.restore(state.peerHighestCounter, state.peerSeenWindow)
+                if (!window.accept(counter)) {
+                    return // Replay, or older than the window
                 }
-                
-                dao.updatePeerCounter(senderId, counter)
+                dao.updatePeerReplayState(senderId, window.highest, window.toBytes())
 
                 // Route based on content_type
                 val contentType = envelope.content_type ?: 0
@@ -413,12 +429,12 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                     FileTransferManager.CONTENT_TYPE_FILE_HEADER -> {
                         fileTransferManager.onFileHeaderReceived(senderId, decryptedBytes)
                         // Send ACK for the header envelope
-                        sendAck(senderId, envelope.envelope_id ?: return@launch)
-                        return@launch
+                        sendAck(senderId, envelope.envelope_id ?: return)
+                        return
                     }
                     FileTransferManager.CONTENT_TYPE_FILE_PART -> {
                         fileTransferManager.onFilePartReceived(senderId, decryptedBytes)
-                        return@launch
+                        return
                     }
                 }
                 
@@ -427,13 +443,13 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
                 if (plaintextRaw.startsWith("ACK:")) {
                     val ackedId = plaintextRaw.substringAfter("ACK:")
                     dao.updateMessageStatus(ackedId, 2) // 2 = Delivered
-                    return@launch
+                    return
                 }
                 
                 if (plaintextRaw.startsWith("READ:")) {
                     val readId = plaintextRaw.substringAfter("READ:")
                     dao.updateMessageStatus(readId, 3) // 3 = Seen
-                    return@launch
+                    return
                 }
                 
                 var actualText = plaintextRaw
@@ -482,9 +498,8 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             } catch (e: Exception) {
                 e.printStackTrace() // Decryption failed
             }
-        }
     }
-    
+
     private fun sendAck(peerId: String, messageId: String) {
         viewModelScope.launch(Dispatchers.IO) {
             sender.send(peerId, "ACK:$messageId".toByteArray(Charsets.UTF_8))
