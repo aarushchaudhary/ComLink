@@ -160,6 +160,13 @@ interface ComLinkDao {
     @Query("UPDATE messages SET status = :status WHERE messageId = :messageId")
     suspend fun updateMessageStatus(messageId: String, status: Int)
 
+    /**
+     * A receipt (ACK/READ) from [peerId]: raises the status of *our own* message to that contact only,
+     * and never lowers it. A contact can't touch other chats' ticks, and a late ACK can't undo "Seen".
+     */
+    @Query("UPDATE messages SET status = :status WHERE messageId = :messageId AND deviceId = :peerId AND isFromMe = 1 AND status < :status")
+    suspend fun raiseOwnMessageStatus(messageId: String, peerId: String, status: Int)
+
     /** Sets the status only if it is higher, so e.g. a late "Delivered" never undoes "Seen". */
     @Query("UPDATE messages SET status = :status WHERE messageId = :messageId AND status < :status")
     suspend fun raiseMessageStatus(messageId: String, status: Int)

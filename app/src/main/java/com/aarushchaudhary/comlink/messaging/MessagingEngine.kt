@@ -63,12 +63,23 @@ class MessagingEngine(
     // Contact -> last time we sent them a PRESENCE
     private val presenceSentAt = ConcurrentHashMap<String, Long>()
 
+    /**
+     * The session cipher for [peerId], or null when there is none: unknown contact, the local Saved
+     * Messages chat (it has no key), or a stored key that isn't valid (e.g. a junk contact added by
+     * an old version). Never throws: an exception here used to crash the app.
+     */
     private suspend fun getOrCreateCipher(peerId: String): SessionCipher? {
-        return sessionCiphers.getOrPut(peerId) {
-            val peer = dao.getPeer(peerId) ?: return null
+        if (peerId == SAVED_MESSAGES_ID) return null
+        sessionCiphers[peerId]?.let { return it }
+        val peer = dao.getPeer(peerId) ?: return null
+        val cipher = try {
             val peerPubKey = Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP)
             SessionCipher(identity.getPrivateKey(), identity.getPublicKey(), peerPubKey)
+        } catch (e: Exception) {
+            android.util.Log.w("MessagingEngine", "No usable key for contact $peerId", e)
+            return null
         }
+        return sessionCiphers.putIfAbsent(peerId, cipher) ?: cipher
     }
 
     // Every outgoing envelope goes through this one sender (it owns the per-contact locks)
@@ -392,6 +403,8 @@ class MessagingEngine(
     private fun processIncomingEnvelope(envelope: Envelope, fromAddress: String) {
         scope.launch(Dispatchers.IO) {
             val senderId = envelope.sender_id ?: return@launch
+            // The local Saved Messages chat is not a real contact: nobody can send "from" it
+            if (senderId == SAVED_MESSAGES_ID) return@launch
             // Only known contacts get a lock, so random sender IDs can't grow the lock map
             dao.getPeer(senderId) ?: return@launch
             // One envelope at a time per contact: the replay window and file assembly never race
@@ -454,13 +467,14 @@ class MessagingEngine(
                 val plaintextRaw = String(decryptedBytes, Charsets.UTF_8)
                 if (plaintextRaw.startsWith("ACK:")) {
                     val ackedId = plaintextRaw.substringAfter("ACK:")
-                    dao.updateMessageStatus(ackedId, 2) // 2 = Delivered
+                    // Only our own message to this contact, and never lower (a late ACK after READ)
+                    dao.raiseOwnMessageStatus(ackedId, senderId, 2) // 2 = Delivered
                     return
                 }
                 
                 if (plaintextRaw.startsWith("READ:")) {
                     val readId = plaintextRaw.substringAfter("READ:")
-                    dao.updateMessageStatus(readId, 3) // 3 = Seen
+                    dao.raiseOwnMessageStatus(readId, senderId, 3) // 3 = Seen
                     return
                 }
                 

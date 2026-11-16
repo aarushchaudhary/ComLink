@@ -54,7 +54,10 @@ class BluetoothService(
     // are unlikely to see the same ID from two different senders
     private val packetCounter = AtomicInteger(kotlin.random.Random.nextInt())
 
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // Bluetooth callbacks start work here; a failure is logged instead of crashing the app
+    private val serviceScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() + CoroutineExceptionHandler { _, e -> Log.e(TAG, "Bluetooth task failed", e) }
+    )
 
     // Reassembles incoming pieces, grouped per sending device
     private val assembler = PacketAssembler()

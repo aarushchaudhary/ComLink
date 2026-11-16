@@ -8,6 +8,7 @@ import com.aarushchaudhary.comlink.data.ComLinkDatabase
 import com.aarushchaudhary.comlink.data.FileCrypto
 import com.aarushchaudhary.comlink.data.SecureDatabase
 import com.aarushchaudhary.comlink.messaging.MessagingEngine
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -38,7 +39,11 @@ class ComLinkApp : Application() {
     /** Temporary decrypted copies handed to other apps (open a document, play a video). */
     val shareCacheDir: File get() = File(cacheDir, "shared")
 
-    private val appScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // An uncaught exception in background work is logged, not allowed to crash the whole app
+    private val appScope = CoroutineScope(
+        Dispatchers.IO + SupervisorJob() +
+            CoroutineExceptionHandler { _, e -> android.util.Log.e("ComLinkApp", "Background task failed", e) }
+    )
 
     override fun onCreate() {
         super.onCreate()
