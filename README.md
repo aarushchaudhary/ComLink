@@ -57,6 +57,7 @@ ComLink relies on a custom multi-layered networking stack:
 * The envelope header (tag, envelope ID, content type, timestamp) is bound to the ciphertext as **AAD**: a relay that changes any of it breaks decryption. Only the hop count (`ttl`) is left out, because relays must lower it.
 * Every message is padded to one of 7 fixed sizes (256 B to 100 KiB) before encryption, so relays can't tell a text from a read receipt by its size.
 * A **sliding replay window** (256 counters) accepts messages that arrive out of order through the mesh, and rejects anything already seen.
+* **Forward secrecy:** inside that encryption, every message except PRESENCE also goes through a **Double Ratchet** (Signal's published algorithm, built on Tink). Each message has its own key, used keys are deleted, and every reply mixes in a fresh X25519 exchange. A key stolen later can't open earlier messages, and a thief loses access again after the next reply. It starts from the QR-code keys, with no server; forward secrecy begins once each side has received one message from the other (the automatic ACK is enough). Keys for late or lost messages are kept for up to 7 days (at most 1,000 per contact). The ratchet runs inside the envelope encryption, so relays never see its keys.
 
 ### Presence
 * `HELLO`/`PING` name nobody: they only say "a ComLink phone is here". A new neighbour gets an encrypted **PRESENCE** for each contact (at most once a minute), and only the right contact can read theirs. A contact is shown **online**, and gets direct sends, only after their PRESENCE decrypts, so nobody can fake someone being online or redirect their messages.
@@ -73,7 +74,7 @@ ComLink relies on a custom multi-layered networking stack:
 * Envelopes between the same two contacts in the same 15-minute window share a tag, so they can be grouped for that window (not across windows, and not with the replies).
 * The timestamp, the content type and the padded size of each envelope.
 * Roughly how many contacts a phone has: a new neighbour receives one PRESENCE per contact.
-* There is **no forward secrecy** yet: someone who records traffic and later steals a private key can decrypt it. This is planned as future work (a Double Ratchet).
+* The very first messages of a new chat, before either side has received anything back, can be read by someone who records them and later steals a private key.
 
 ```mermaid
 sequenceDiagram

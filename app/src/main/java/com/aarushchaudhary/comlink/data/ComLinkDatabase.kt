@@ -209,11 +209,64 @@ interface ComLinkDao {
 
     @Query("UPDATE messages SET thumbnailPath = :path WHERE messageId = :messageId")
     suspend fun updateThumbnailPath(messageId: String, path: String)
+
+    // --- Double Ratchet (forward secrecy) ---
+
+    @Query("SELECT state FROM ratchet_states WHERE deviceId = :deviceId")
+    suspend fun getRatchetState(deviceId: String): ByteArray?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveRatchetState(state: RatchetStateEntity)
+
+    @Query("SELECT messageKey FROM skipped_message_keys WHERE deviceId = :deviceId AND ratchetKey = :ratchetKey AND messageNumber = :messageNumber")
+    suspend fun getSkippedKey(deviceId: String, ratchetKey: String, messageNumber: Int): ByteArray?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertSkippedKeys(keys: List<SkippedKeyEntity>)
+
+    @Query("DELETE FROM skipped_message_keys WHERE deviceId = :deviceId AND ratchetKey = :ratchetKey AND messageNumber = :messageNumber")
+    suspend fun deleteSkippedKey(deviceId: String, ratchetKey: String, messageNumber: Int)
+
+    /** Keeps only the newest [keep] skipped keys for this contact. */
+    @Query("""DELETE FROM skipped_message_keys WHERE deviceId = :deviceId AND rowid NOT IN
+        (SELECT rowid FROM skipped_message_keys WHERE deviceId = :deviceId ORDER BY createdAt DESC, messageNumber DESC LIMIT :keep)""")
+    suspend fun trimSkippedKeys(deviceId: String, keep: Int)
+
+    @Query("DELETE FROM skipped_message_keys WHERE createdAt < :before")
+    suspend fun deleteSkippedKeysOlderThan(before: Long)
+
+    /** A contact's key changed: their ratchet starts over. */
+    @Query("DELETE FROM ratchet_states WHERE deviceId = :deviceId")
+    suspend fun deleteRatchetState(deviceId: String)
+
+    @Query("DELETE FROM skipped_message_keys WHERE deviceId = :deviceId")
+    suspend fun deleteSkippedKeys(deviceId: String)
 }
 
+/** One contact's Double Ratchet state (see crypto/DoubleRatchet.kt), saved after every message. */
+@Entity(tableName = "ratchet_states")
+class RatchetStateEntity(
+    @PrimaryKey val deviceId: String,
+    val state: ByteArray
+)
+
+/** A message key kept for a message that hasn't arrived yet (late or lost). Deleted once used, or after 7 days. */
+@Entity(tableName = "skipped_message_keys", primaryKeys = ["deviceId", "ratchetKey", "messageNumber"])
+class SkippedKeyEntity(
+    val deviceId: String,
+    /** The sender's ratchet public key, as hex. */
+    val ratchetKey: String,
+    val messageNumber: Int,
+    val messageKey: ByteArray,
+    val createdAt: Long
+)
+
 @Database(
-    entities = [PeerEntity::class, SessionStateEntity::class, MessageEntity::class, FileTransferEntity::class], 
-    version = 8,
+    entities = [
+        PeerEntity::class, SessionStateEntity::class, MessageEntity::class, FileTransferEntity::class,
+        RatchetStateEntity::class, SkippedKeyEntity::class
+    ],
+    version = 9,
     exportSchema = true,
     autoMigrations = [
         AutoMigration(from = 2, to = 3),
@@ -221,7 +274,9 @@ interface ComLinkDao {
         AutoMigration(from = 4, to = 5),
         AutoMigration(from = 5, to = 6),
         AutoMigration(from = 6, to = 7),
-        AutoMigration(from = 7, to = 8)
+        AutoMigration(from = 7, to = 8),
+        // New tables for the Double Ratchet; existing data untouched
+        AutoMigration(from = 8, to = 9)
     ]
 )
 abstract class ComLinkDatabase : RoomDatabase() {

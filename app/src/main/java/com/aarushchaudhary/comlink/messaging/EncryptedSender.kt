@@ -9,6 +9,9 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.random.Random
 
+/** A counter and inner-layer key handed out in advance by [EncryptedSender.reserveCounters]. */
+class ReservedSlot(val counter: Int, internal val seal: (ByteArray) -> ByteArray)
+
 /**
  * The single place where outgoing envelopes are encrypted and built.
  *
@@ -24,6 +27,8 @@ class EncryptedSender(
     /** Persists the next unused counter for this contact. */
     private val saveCounter: suspend (peerId: String, nextCounter: Int) -> Unit,
     private val cipherFor: suspend (peerId: String) -> SessionCipher?,
+    /** The Double Ratchet, inside the envelope encryption (null in tests of the outer layer only). */
+    private val inner: InnerLayer? = null,
     /** Hands the envelope for [peerId] to the mesh; [direct] targets the peer's own connection. */
     private val transmit: suspend (peerId: String, envelope: Envelope, direct: Boolean, noResponse: Boolean) -> Boolean,
     /** Picks the tag window; the send time, not the envelope timestamp (a retry keeps the old one). */
@@ -68,33 +73,40 @@ class EncryptedSender(
         val counter = loadCounter(peerId) ?: return@withLock false
         if (counter >= MAX_COUNTER) return@withLock false // never wrap the 24-bit nonce counter
         val cipher = cipherFor(peerId) ?: return@withLock false
+        val payload = if (inner != null && ContentTypes.usesRatchet(contentType)) {
+            inner.reserve(peerId, 1)?.single()?.invoke(plaintext) ?: return@withLock false
+        } else {
+            plaintext
+        }
         saveCounter(peerId, counter + 1)
         // Sent while holding the lock, so envelopes leave in counter order
-        transmit(peerId, seal(cipher, plaintext, counter, contentType, envelopeId, timestamp, ttl), direct, noResponse)
+        transmit(peerId, seal(cipher, payload, counter, contentType, envelopeId, timestamp, ttl), direct, noResponse)
     }
 
     /**
-     * Reserves [count] consecutive counters in one lock acquisition (used for file parts).
-     * Returns null when there's no session, or when the counters would pass [MAX_COUNTER].
+     * Reserves [count] consecutive counters, and as many ratchet keys, in one lock acquisition
+     * (used for file parts). Returns null when there's no session, or when the counters would
+     * pass [MAX_COUNTER].
      */
-    suspend fun reserveCounters(peerId: String, count: Int): IntArray? = lockFor(peerId).withLock {
+    suspend fun reserveCounters(peerId: String, count: Int): List<ReservedSlot>? = lockFor(peerId).withLock {
         val start = loadCounter(peerId) ?: return@withLock null
         if (start.toLong() + count > MAX_COUNTER) return@withLock null
+        val sealers = if (inner != null) inner.reserve(peerId, count) ?: return@withLock null else null
         saveCounter(peerId, start + count)
-        IntArray(count) { start + it }
+        List(count) { i -> ReservedSlot(start + i, sealers?.get(i) ?: { it }) }
     }
 
-    /** Sends with a counter that [reserveCounters] already handed out. No lock needed. */
+    /** Sends with a slot that [reserveCounters] already handed out. No lock needed. */
     suspend fun sendReserved(
         peerId: String,
         plaintext: ByteArray,
-        counter: Int,
+        slot: ReservedSlot,
         contentType: Int,
         direct: Boolean = true,
         noResponse: Boolean = true
     ): Boolean {
         val cipher = cipherFor(peerId) ?: return false
-        val envelope = seal(cipher, plaintext, counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis(), randomStartTtl())
+        val envelope = seal(cipher, slot.seal(plaintext), slot.counter, contentType, UUID.randomUUID().toString(), System.currentTimeMillis(), randomStartTtl())
         return transmit(peerId, envelope, direct, noResponse)
     }
 

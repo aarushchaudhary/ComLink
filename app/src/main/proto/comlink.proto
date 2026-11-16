@@ -6,6 +6,8 @@ message Envelope {
   // 1 and 2 were sender_id / recipient_id in plain text. Gone: relays now see only the tag.
   reserved 1, 2;
   reserved "sender_id", "recipient_id";
+  // AES-256-GCM of the padded payload. Except for PRESENCE, the payload is itself a Double Ratchet
+  // message (crypto/DoubleRatchet.kt), so its keys stay hidden from relays.
   bytes ciphertext = 3;
   bytes nonce = 4;
   int64 timestamp = 5;

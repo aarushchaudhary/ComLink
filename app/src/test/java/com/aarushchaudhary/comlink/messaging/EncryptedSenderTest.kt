@@ -66,8 +66,8 @@ class EncryptedSenderTest {
             async(Dispatchers.Default) { sender.send(peer, "x".toByteArray()) }
         }
         normal.awaitAll()
-        val reservedCounters = reserved.awaitAll().flatMap { it.toList() }
-        reservedCounters.forEach { sender.sendReserved(peer, "part".toByteArray(), it, contentType = 2) }
+        val reservedSlots = reserved.awaitAll().flatten()
+        reservedSlots.forEach { sender.sendReserved(peer, "part".toByteArray(), it, contentType = 2) }
 
         // 200 normal + 20 x 50 reserved = 1200 envelopes, every nonce different
         assertEquals(1200, sent.size)
@@ -159,10 +159,14 @@ class EncryptedSenderTest {
             part_index = 99,
             data_ = okio.ByteString.of(*ByteArray(com.aarushchaudhary.comlink.data.TransferChecks.PART_SIZE))
         )
-        assertTrue(sender.sendReserved(peer, part.encode(), counter = 7, contentType = 2))
+        val slot = sender.reserveCounters(peer, 1)!!.single()
+        assertTrue(sender.sendReserved(peer, part.encode(), slot, contentType = 2))
         val wireSize = sent.single().encode().size
         // BluetoothService carries at most 255 pieces of 500 data bytes per payload
         assertTrue("file part envelope is $wireSize bytes", wireSize <= 255 * 500)
+        // With the ratchet's overhead it still fits the largest padding bucket (no odd size)
+        val withRatchet = part.encode().size + com.aarushchaudhary.comlink.crypto.DoubleRatchet.OVERHEAD
+        assertEquals(Padding.BUCKETS.last(), Padding.paddedSize(withRatchet))
     }
 
     @Test
@@ -183,5 +187,40 @@ class EncryptedSenderTest {
         now += SessionCipher.TAG_WINDOW_MS
         sender.send(peer, "x".toByteArray(), envelopeId = "m1", timestamp = now - 2 * 3_600_000L)
         assertEquals(cipher.outgoingTag(SessionCipher.tagWindow(now)).toList(), sent.last().tag.toByteArray().toList())
+    }
+
+    @Test
+    fun innerLayerSealsEverythingButPresenceAndFileParts() = runBlocking {
+        val innerCalls = mutableListOf<Int>()
+        val sender = EncryptedSender(
+            loadCounter = { 0 }, saveCounter = { _, _ -> },
+            cipherFor = { cipher },
+            inner = object : InnerLayer {
+                override suspend fun reserve(peerId: String, count: Int): List<(ByteArray) -> ByteArray> {
+                    innerCalls.add(count)
+                    return List(count) { { p: ByteArray -> "R".toByteArray() + p } }
+                }
+            },
+            transmit = { _, envelope, _, _ -> sent.add(envelope); true }
+        )
+        sender.send(peer, "text".toByteArray(), contentType = ContentTypes.MESSAGE)
+        sender.send(peer, "PRESENCE".toByteArray(), contentType = ContentTypes.PRESENCE, ttl = 1)
+        sender.reserveCounters(peer, 3)
+        assertEquals(listOf(1, 3), innerCalls) // text: 1 key, presence: none, file parts: 3 at once
+    }
+
+    @Test
+    fun noRatchetSessionMeansNothingIsSent() = runBlocking {
+        val sender = EncryptedSender(
+            loadCounter = { 0 }, saveCounter = { _, _ -> error("counter must not move") },
+            cipherFor = { cipher },
+            inner = object : InnerLayer {
+                override suspend fun reserve(peerId: String, count: Int): List<(ByteArray) -> ByteArray>? = null
+            },
+            transmit = { _, envelope, _, _ -> sent.add(envelope); true }
+        )
+        assertFalse(sender.send(peer, "x".toByteArray()))
+        assertNull(sender.reserveCounters(peer, 2))
+        assertTrue(sent.isEmpty())
     }
 }

@@ -4,14 +4,19 @@ import android.net.Uri
 import android.util.Base64
 import com.aarushchaudhary.comlink.ComLinkApp
 import com.aarushchaudhary.comlink.crypto.ContactQr
+import com.aarushchaudhary.comlink.crypto.DoubleRatchet
+import com.aarushchaudhary.comlink.crypto.RatchetState
 import com.aarushchaudhary.comlink.crypto.ReplayWindow
 import com.aarushchaudhary.comlink.crypto.SessionCipher
 import com.aarushchaudhary.comlink.crypto.TagDirectory
 import com.aarushchaudhary.comlink.data.FileTransferManager
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
+import com.aarushchaudhary.comlink.data.RatchetStateEntity
+import com.aarushchaudhary.comlink.data.SkippedKeyEntity
 import com.aarushchaudhary.comlink.data.SessionStateEntity
 import com.aarushchaudhary.comlink.proto.Envelope
+import androidx.room.withTransaction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -47,6 +52,9 @@ class MessagingEngine(
         private const val STRANGER_PRESENCE_GAP_MS = 60_000L
         /** READ receipts per envelope (36-character IDs: 40 of them fit the 4 KB padding bucket). */
         private const val READ_BATCH = 40
+        /** Skipped ratchet keys kept per contact, and for how long (messages later than that are lost). */
+        private const val MAX_SKIPPED_KEYS = 1000
+        private const val SKIPPED_KEY_LIFETIME_MS = 7 * 24 * 3_600_000L
         private val PRESENCE_PAYLOAD = "PRESENCE".toByteArray(Charsets.UTF_8)
     }
 
@@ -93,11 +101,44 @@ class MessagingEngine(
         return sessionCiphers.putIfAbsent(peerId, cipher) ?: cipher
     }
 
+    /** The Double Ratchet's first state with a contact, from the keys swapped by QR code. */
+    private suspend fun initialRatchet(peerId: String): RatchetState? {
+        if (peerId == SAVED_MESSAGES_ID) return null
+        val peer = dao.getPeer(peerId) ?: return null
+        return try {
+            DoubleRatchet.initial(identity.getPrivateKey(), identity.getPublicKey(), Base64.decode(peer.publicKeyBase64, Base64.NO_WRAP))
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    // Forward secrecy: every message but PRESENCE also goes through the contact's Double Ratchet
+    private val ratchet = RatchetSessions(
+        loadState = { peerId -> dao.getRatchetState(peerId) },
+        initialState = { peerId -> initialRatchet(peerId) },
+        saveState = { peerId, state -> dao.saveRatchetState(RatchetStateEntity(peerId, state)) },
+        storedKey = { peerId, ratchetKey, number -> dao.getSkippedKey(peerId, ratchetKey, number) },
+        commitOpened = { peerId, state, newSkipped, usedKey ->
+            app.database.withTransaction {
+                dao.saveRatchetState(RatchetStateEntity(peerId, state))
+                if (usedKey != null) dao.deleteSkippedKey(peerId, usedKey.first, usedKey.second)
+                if (newSkipped.isNotEmpty()) {
+                    val now = System.currentTimeMillis()
+                    dao.insertSkippedKeys(newSkipped.map {
+                        SkippedKeyEntity(peerId, RatchetSessions.toHex(it.ratchetKey), it.messageNumber, it.messageKey, now)
+                    })
+                    dao.trimSkippedKeys(peerId, MAX_SKIPPED_KEYS)
+                }
+            }
+        }
+    )
+
     // Every outgoing envelope goes through this one sender (it owns the per-contact locks)
     private val sender = EncryptedSender(
         loadCounter = { peerId -> dao.getSessionState(peerId)?.myNextCounter },
         saveCounter = { peerId, next -> dao.updateMyCounter(peerId, next) },
         cipherFor = { peerId -> getOrCreateCipher(peerId) },
+        inner = ratchet,
         transmit = { peerId, envelope, direct, noResponse ->
             if (direct) router.sendDirectMessage(peerId, envelope, noResponse)
             else router.sendLocalMessage(envelope)
@@ -140,6 +181,14 @@ class MessagingEngine(
             }
         }
         
+        // Skipped ratchet keys older than a week: those messages aren't coming any more
+        scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                dao.deleteSkippedKeysOlderThan(System.currentTimeMillis() - SKIPPED_KEY_LIFETIME_MS)
+                kotlinx.coroutines.delay(3_600_000L)
+            }
+        }
+
         // Files stored before encryption existed: encrypt them once, in the background
         scope.launch(Dispatchers.IO) { fileTransferManager.encryptLegacyFiles() }
 
@@ -260,6 +309,8 @@ class MessagingEngine(
                                 // cipher and start counters fresh. Messages are kept.
                                 sessionCiphers.remove(peerDeviceId)
                                 dao.resetSessionState(peerDeviceId)
+                                dao.deleteRatchetState(peerDeviceId)
+                                dao.deleteSkippedKeys(peerDeviceId)
                             }
                         }
                     }
@@ -459,9 +510,19 @@ class MessagingEngine(
                 }
                 dao.updatePeerReplayState(senderId, window.highest, window.toBytes())
 
-                // Decide what it is (pure and unit-tested: IncomingMessage.classify), then act on it
+                // Inner layer: everything but PRESENCE is also sealed with the Double Ratchet
                 val contentType = envelope.content_type ?: ContentTypes.MESSAGE
-                when (val incoming = IncomingMessage.classify(contentType, decryptedBytes)) {
+                val content = if (ContentTypes.usesRatchet(contentType)) {
+                    ratchet.open(senderId, decryptedBytes) ?: run {
+                        android.util.Log.w("MessagingEngine", "Ratchet message from $senderId didn't open (duplicate, too late, or out of sync)")
+                        return
+                    }
+                } else {
+                    decryptedBytes
+                }
+
+                // Decide what it is (pure and unit-tested: IncomingMessage.classify), then act on it
+                when (val incoming = IncomingMessage.classify(contentType, content)) {
                     is IncomingMessage.FileHeader -> {
                         fileTransferManager.onFileHeaderReceived(senderId, incoming.payload)
                         // Send ACK for the header envelope

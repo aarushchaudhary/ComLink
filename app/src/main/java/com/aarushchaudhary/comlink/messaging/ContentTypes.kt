@@ -10,4 +10,11 @@ object ContentTypes {
     const val PRESENCE = 3
     /** Which parts of a transfer the receiver holds, or a request for that. */
     const val FILE_STATUS = 4
+
+    /**
+     * Everything but PRESENCE also goes through the Double Ratchet. PRESENCE says nothing secret,
+     * and it is sent to every contact whenever a stranger is nearby: through the ratchet, a contact
+     * away for a day would face more skipped messages than the ratchet allows.
+     */
+    fun usesRatchet(contentType: Int): Boolean = contentType != PRESENCE
 }
