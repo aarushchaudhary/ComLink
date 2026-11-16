@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">ComLink</string>
+    <string name="background_delivery_channel">Background delivery</string>
+    <string name="background_delivery_notification">Mesh is running: messages are delivered in the background</string>
 </resources>

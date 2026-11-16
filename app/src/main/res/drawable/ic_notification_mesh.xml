@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status bar icon for the background-delivery notification: a node with signal arcs.
+     Status bar icons must be a single colour; Android only uses the shape. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- centre node -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,10a2,2 0,1 0,0.001 0z" />
+    <!-- inner arcs -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M8.5,8.5a5,5 0,0 0,0 7M15.5,8.5a5,5 0,0 1,0 7" />
+    <!-- outer arcs -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="2"
+        android:strokeLineCap="round"
+        android:pathData="M5.5,5.5a9,9 0,0 0,0 13M18.5,5.5a9,9 0,0 1,0 13" />
+</vector>
