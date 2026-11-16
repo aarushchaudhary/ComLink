@@ -21,12 +21,25 @@ object SecureDatabase {
     private const val TAG = "SecureDatabase"
     const val PLAIN_NAME = "comlink_db"
     const val ENCRYPTED_NAME = "comlink_secure_db"
-    private const val TEMP_NAME = "comlink_secure_db.migrating"
+    private const val TEMP_SUFFIX = ".migrating"
 
-    fun open(context: Context, passphrase: String): ComLinkDatabase {
+    /** True when the one-time move from the old plain database still has to run (it can take a while). */
+    fun needsMigration(context: Context): Boolean =
+        context.getDatabasePath(PLAIN_NAME).exists() && !context.getDatabasePath(ENCRYPTED_NAME).exists()
+
+    /**
+     * The file names are parameters only so device tests can use their own files: they run inside
+     * the app's process, next to the app's real database.
+     */
+    fun open(
+        context: Context,
+        passphrase: String,
+        plainName: String = PLAIN_NAME,
+        encryptedName: String = ENCRYPTED_NAME
+    ): ComLinkDatabase {
         System.loadLibrary("sqlcipher")
-        val plain = context.getDatabasePath(PLAIN_NAME)
-        val encrypted = context.getDatabasePath(ENCRYPTED_NAME)
+        val plain = context.getDatabasePath(plainName)
+        val encrypted = context.getDatabasePath(encryptedName)
 
         if (plain.exists() && !encrypted.exists()) {
             val moved = try {
@@ -37,21 +50,26 @@ object SecureDatabase {
             }
             if (!moved) {
                 // Keep working on the plain database; try again on the next launch
-                return Room.databaseBuilder(context, ComLinkDatabase::class.java, PLAIN_NAME).build()
+                return Room.databaseBuilder(context, ComLinkDatabase::class.java, plainName).build()
             }
         }
 
-        return Room.databaseBuilder(context, ComLinkDatabase::class.java, ENCRYPTED_NAME)
+        return Room.databaseBuilder(context, ComLinkDatabase::class.java, encryptedName)
             .openHelperFactory(SupportOpenHelperFactory(passphrase.toByteArray(Charsets.UTF_8)))
             .build()
     }
 
     /** Returns true once [encrypted] holds a verified copy and [plain] (with its side files) is gone. */
     private fun migrate(context: Context, plain: File, encrypted: File, passphrase: String): Boolean {
-        val temp = context.getDatabasePath(TEMP_NAME)
+        val temp = File(encrypted.path + TEMP_SUFFIX)
         deleteWithSideFiles(temp) // leftovers of an earlier, interrupted attempt
 
-        val source = SQLiteDatabase.openDatabase(plain.path, "", null, SQLiteDatabase.OPEN_READWRITE, null)
+        // CREATE_IF_NECESSARY matters: SQLite gives an ATTACHed database the main one's open flags,
+        // so without it the ATTACH below can't create the new encrypted file (found on a device:
+        // "unable to open database ... (code 14)"). The plain database itself always exists here.
+        val source = SQLiteDatabase.openDatabase(
+            plain.path, "", null, SQLiteDatabase.OPEN_READWRITE or SQLiteDatabase.CREATE_IF_NECESSARY, null
+        )
         val expected: Map<String, Long>
         val version: Int
         try {

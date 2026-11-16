@@ -25,10 +25,10 @@ fun ComLinkTheme(
     context: Context,
     content: @Composable () -> Unit
 ) {
-    val themeModeStr by context.dataStore.data.map { it[themeModePref] ?: ThemeMode.SYSTEM.name }
+    val themeModeStr by remember { context.dataStore.data.map { it[themeModePref] ?: ThemeMode.SYSTEM.name } }
         .collectAsState(initial = ThemeMode.SYSTEM.name)
         
-    val accentColorInt by context.dataStore.data.map { it[customAccentColorPref] ?: android.graphics.Color.GREEN }
+    val accentColorInt by remember { context.dataStore.data.map { it[customAccentColorPref] ?: android.graphics.Color.GREEN } }
         .collectAsState(initial = android.graphics.Color.GREEN)
     
     val themeMode = ThemeMode.valueOf(themeModeStr)

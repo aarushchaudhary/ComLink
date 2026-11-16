@@ -43,12 +43,12 @@ fun SettingsScreen(context: Context, onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val accentColor = MaterialTheme.colorScheme.primary
     
-    val initialName by context.dataStore.data.map { it[myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
+    val initialName by remember { context.dataStore.data.map { it[myDisplayNamePref] ?: "Cypherpunk User" } }.collectAsState(initial = "Cypherpunk User")
     var localName by remember { mutableStateOf<String?>(null) }
     val displayNameToUse = localName ?: initialName
 
     // Background delivery switch: on by default. ComLinkViewModel starts/stops MeshService to match.
-    val backgroundDelivery by context.dataStore.data.map { it[MeshService.BACKGROUND_DELIVERY_PREF] ?: true }
+    val backgroundDelivery by remember { context.dataStore.data.map { it[MeshService.BACKGROUND_DELIVERY_PREF] ?: true } }
         .collectAsState(initial = true)
     var confirmTurnOff by remember { mutableStateOf(false) }
 

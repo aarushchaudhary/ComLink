@@ -440,86 +440,38 @@ class MessagingEngine(
                 }
                 dao.updatePeerReplayState(senderId, window.highest, window.toBytes())
 
-                // Route based on content_type
-                val contentType = envelope.content_type ?: FileTransferManager.CONTENT_TYPE_MESSAGE
-                when (contentType) {
-                    FileTransferManager.CONTENT_TYPE_FILE_HEADER -> {
-                        fileTransferManager.onFileHeaderReceived(senderId, decryptedBytes)
+                // Decide what it is (pure and unit-tested: IncomingMessage.classify), then act on it
+                val contentType = envelope.content_type ?: ContentTypes.MESSAGE
+                when (val incoming = IncomingMessage.classify(contentType, decryptedBytes)) {
+                    is IncomingMessage.FileHeader -> {
+                        fileTransferManager.onFileHeaderReceived(senderId, incoming.payload)
                         // Send ACK for the header envelope
                         sendAck(senderId, envelope.envelope_id ?: return)
-                        return
                     }
-                    FileTransferManager.CONTENT_TYPE_FILE_PART -> {
-                        fileTransferManager.onFilePartReceived(senderId, decryptedBytes)
-                        return
-                    }
-                    FileTransferManager.CONTENT_TYPE_PRESENCE -> {
-                        handlePresence(senderId, fromAddress)
-                        return
-                    }
-                    FileTransferManager.CONTENT_TYPE_FILE_STATUS -> {
-                        fileTransferManager.onFileStatusReceived(senderId, decryptedBytes)
-                        return
-                    }
-                }
-                
-                // content_type == 0 (MESSAGE): existing text/ACK/READ logic
-                val plaintextRaw = String(decryptedBytes, Charsets.UTF_8)
-                if (plaintextRaw.startsWith("ACK:")) {
-                    val ackedId = plaintextRaw.substringAfter("ACK:")
+                    is IncomingMessage.FilePart -> fileTransferManager.onFilePartReceived(senderId, incoming.payload)
+                    is IncomingMessage.Presence -> handlePresence(senderId, fromAddress)
+                    is IncomingMessage.FileStatus -> fileTransferManager.onFileStatusReceived(senderId, incoming.payload)
                     // Only our own message to this contact, and never lower (a late ACK after READ)
-                    dao.raiseOwnMessageStatus(ackedId, senderId, 2) // 2 = Delivered
-                    return
-                }
-                
-                if (plaintextRaw.startsWith("READ:")) {
-                    val readId = plaintextRaw.substringAfter("READ:")
-                    dao.raiseOwnMessageStatus(readId, senderId, 3) // 3 = Seen
-                    return
-                }
-                
-                var actualText = plaintextRaw
-                var repId: String? = null
-                var repSender: String? = null
-                var repSnippet: String? = null
-                
-                if (plaintextRaw.startsWith("{")) {
-                    try {
-                        val json = org.json.JSONObject(plaintextRaw)
-                        if (json.has("text")) {
-                            actualText = json.getString("text")
-                            repId = json.optString("replyId", "").takeIf { it.isNotEmpty() }
-                            repSender = json.optString("replySender", "").takeIf { it.isNotEmpty() }
-                            repSnippet = json.optString("replySnippet", "").takeIf { it.isNotEmpty() }
-                        }
-                    } catch (e: Exception) {
-                        // Not JSON, just use as text
+                    is IncomingMessage.Ack -> dao.raiseOwnMessageStatus(incoming.messageId, senderId, 2) // Delivered
+                    is IncomingMessage.Read -> dao.raiseOwnMessageStatus(incoming.messageId, senderId, 3) // Seen
+                    is IncomingMessage.Unknown -> android.util.Log.w("MessagingEngine", "Ignored unknown content type ${incoming.contentType} from $senderId")
+                    is IncomingMessage.Chat -> {
+                        val msgEntity = MessageEntity(
+                            messageId = envelope.envelope_id ?: UUID.randomUUID().toString(),
+                            deviceId = senderId,
+                            isFromMe = false,
+                            plaintext = incoming.text,
+                            timestamp = envelope.timestamp ?: System.currentTimeMillis(),
+                            replyToMessageId = incoming.replyId,
+                            replyToSenderId = incoming.replySender,
+                            replyToTextSnippet = incoming.replySnippet,
+                            messageType = if (incoming.isLocation) "LOCATION" else "TEXT"
+                        )
+                        dao.insertMessage(msgEntity)
+                        dao.updatePeerLastMessageTime(senderId, msgEntity.timestamp)
+                        sendAck(senderId, msgEntity.messageId)
                     }
                 }
-                
-                var finalMsgType = "TEXT"
-                
-                if (actualText.startsWith("LOCATION:")) {
-                    finalMsgType = "LOCATION"
-                    actualText = actualText.substringAfter("LOCATION:")
-                }
-                
-                val msgEntity = MessageEntity(
-                    messageId = envelope.envelope_id ?: UUID.randomUUID().toString(),
-                    deviceId = senderId,
-                    isFromMe = false,
-                    plaintext = actualText,
-                    timestamp = envelope.timestamp ?: System.currentTimeMillis(),
-                    replyToMessageId = repId,
-                    replyToSenderId = repSender,
-                    replyToTextSnippet = repSnippet,
-                    messageType = finalMsgType
-                )
-                dao.insertMessage(msgEntity)
-                dao.updatePeerLastMessageTime(senderId, msgEntity.timestamp)
-                
-                // Send ACK
-                sendAck(senderId, msgEntity.messageId)
                 
             } catch (e: Exception) {
                 e.printStackTrace() // Decryption failed
@@ -535,7 +487,7 @@ class MessagingEngine(
         val last = presenceSentAt[peerId]
         if (!force && last != null && now - last < PRESENCE_MIN_GAP_MS) return
         presenceSentAt[peerId] = now
-        sender.send(peerId, PRESENCE_PAYLOAD, contentType = FileTransferManager.CONTENT_TYPE_PRESENCE, ttl = 1)
+        sender.send(peerId, PRESENCE_PAYLOAD, contentType = ContentTypes.PRESENCE, ttl = 1)
     }
 
     /**

@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
+import com.aarushchaudhary.comlink.messaging.ContentTypes
 import com.aarushchaudhary.comlink.messaging.EncryptedSender
 import com.aarushchaudhary.comlink.proto.FileHeader
 import com.aarushchaudhary.comlink.proto.FilePart
@@ -44,11 +45,6 @@ class FileTransferManager(
         private const val TAG = "FileTransfer"
         const val PART_SIZE = TransferChecks.PART_SIZE  // ~100 KB per part (stays within 128 KB BLE envelope limit)
         const val MAX_FILE_SIZE = TransferChecks.MAX_FILE_SIZE  // 10 MB hard limit
-        const val CONTENT_TYPE_MESSAGE = 0
-        const val CONTENT_TYPE_FILE_HEADER = 1
-        const val CONTENT_TYPE_FILE_PART = 2
-        const val CONTENT_TYPE_PRESENCE = 3
-        const val CONTENT_TYPE_FILE_STATUS = 4
 
         /** Sender: wait this long for the receiver's status before asking for it. */
         private const val STATUS_WAIT_MS = 15_000L
@@ -293,7 +289,7 @@ class FileTransferManager(
             thumbnail = thumbnailBytes?.let { okio.ByteString.of(*it) } ?: okio.ByteString.EMPTY,
             message_id = transfer.messageId
         )
-        val sent = sender.send(transfer.peerDeviceId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)
+        val sent = sender.send(transfer.peerDeviceId, header.encode(), contentType = ContentTypes.FILE_HEADER)
         if (!sent) Log.e(TAG, "Failed to send FILE_HEADER for transfer ${transfer.transferId}")
         return sent
     }
@@ -337,7 +333,7 @@ class FileTransferManager(
                 val partData = buffer.array()
 
                 val part = FilePart(transfer_id = transferId, part_index = i, data_ = okio.ByteString.of(*partData))
-                if (!sender.sendReserved(peerId, part.encode(), counters[n], CONTENT_TYPE_FILE_PART)) {
+                if (!sender.sendReserved(peerId, part.encode(), counters[n], ContentTypes.FILE_PART)) {
                     Log.e(TAG, "Failed to send FILE_PART $i/$partCount for transfer $transferId")
                     if (trackProgress) dao.updateLastSentPartIndex(transferId, i)
                     return false
@@ -356,7 +352,7 @@ class FileTransferManager(
 
     private suspend fun requestStatus(transfer: FileTransferEntity) {
         val request = FileStatus(transfer_id = transfer.transferId, request = true)
-        sender.send(transfer.peerDeviceId, request.encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+        sender.send(transfer.peerDeviceId, request.encode(), contentType = ContentTypes.FILE_STATUS)
     }
 
     private suspend fun markDelivered(transfer: FileTransferEntity) {
@@ -662,7 +658,7 @@ class FileTransferManager(
             when {
                 // Never saw the header: say so (part_count 0), and the sender starts over
                 transfer == null -> scope.launch(Dispatchers.IO) {
-                    sender.send(senderId, FileStatus(transfer_id = transferId, part_count = 0).encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+                    sender.send(senderId, FileStatus(transfer_id = transferId, part_count = 0).encode(), contentType = ContentTypes.FILE_STATUS)
                 }
                 !transfer.isOutgoing && transfer.peerDeviceId == senderId -> reportStatus(transfer)
                 else -> Log.w(TAG, "Ignored status request from $senderId for a transfer that isn't theirs")
@@ -692,7 +688,7 @@ class FileTransferManager(
                 received = okio.ByteString.of(*PartBitmap.encode(transfer.partCount, held)),
                 complete = complete
             )
-            sender.send(transfer.peerDeviceId, status.encode(), contentType = CONTENT_TYPE_FILE_STATUS)
+            sender.send(transfer.peerDeviceId, status.encode(), contentType = ContentTypes.FILE_STATUS)
         }
     }
 

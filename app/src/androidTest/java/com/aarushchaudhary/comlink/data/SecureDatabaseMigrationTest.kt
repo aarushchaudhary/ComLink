@@ -26,7 +26,14 @@ class SecureDatabaseMigrationTest {
     private val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
     private val passphrase = "0123456789abcdef".repeat(4) // 64 hex characters, like the real one
 
-    private fun dbFiles() = listOf(SecureDatabase.PLAIN_NAME, SecureDatabase.ENCRYPTED_NAME)
+    // Own file names: this test runs inside the app's process, and the app opens its real
+    // database (comlink_db / comlink_secure_db) at the same time, with its own key
+    private val plainName = "test_comlink_db"
+    private val encryptedName = "test_comlink_secure_db"
+
+    private fun open() = SecureDatabase.open(context, passphrase, plainName, encryptedName)
+
+    private fun dbFiles() = listOf(plainName, encryptedName, "$encryptedName.migrating")
         .flatMap { name -> listOf("", "-wal", "-shm", "-journal").map { File(context.getDatabasePath(name).path + it) } }
 
     @Before
@@ -38,7 +45,7 @@ class SecureDatabaseMigrationTest {
     @Test
     fun plainDatabaseIsMovedWithEveryRowAndThenDeleted() = runBlocking {
         // An install from before encryption: a plain Room database with some chats
-        val plain = Room.databaseBuilder(context, ComLinkDatabase::class.java, SecureDatabase.PLAIN_NAME).build()
+        val plain = Room.databaseBuilder(context, ComLinkDatabase::class.java, plainName).build()
         val dao = plain.comLinkDao()
         dao.insertPeer(PeerEntity("bob-device-id-000", "a2V5", "Bob", 0L))
         dao.insertSessionState(SessionStateEntity("bob-device-id-000", myNextCounter = 42, peerHighestCounter = 17))
@@ -47,7 +54,7 @@ class SecureDatabaseMigrationTest {
         }
         plain.close()
 
-        val secure = SecureDatabase.open(context, passphrase)
+        val secure = open()
         val sdao = secure.comLinkDao()
         assertEquals(250, sdao.getMessagesForPeer("bob-device-id-000").first().size)
         assertEquals("Bob", sdao.getPeer("bob-device-id-000")?.contactName)
@@ -56,8 +63,8 @@ class SecureDatabaseMigrationTest {
         secure.close()
 
         // The plain file is gone, and the new one isn't readable as plain SQLite
-        assertFalse(context.getDatabasePath(SecureDatabase.PLAIN_NAME).exists())
-        val encrypted = context.getDatabasePath(SecureDatabase.ENCRYPTED_NAME)
+        assertFalse(context.getDatabasePath(plainName).exists())
+        val encrypted = context.getDatabasePath(encryptedName)
         assertTrue(encrypted.exists())
         val header = encrypted.inputStream().use { input -> ByteArray(16).also { input.read(it) } }
         assertFalse(String(header, Charsets.ISO_8859_1).startsWith("SQLite format 3"))
@@ -65,21 +72,21 @@ class SecureDatabaseMigrationTest {
 
     @Test
     fun freshInstallGetsAnEncryptedDatabase() = runBlocking {
-        val db = SecureDatabase.open(context, passphrase)
+        val db = open()
         db.comLinkDao().insertPeer(PeerEntity("carol-device-id-0", "a2V5", "Carol", 0L))
         assertNotNull(db.comLinkDao().getPeer("carol-device-id-0"))
         db.close()
-        assertFalse(context.getDatabasePath(SecureDatabase.PLAIN_NAME).exists())
-        assertTrue(context.getDatabasePath(SecureDatabase.ENCRYPTED_NAME).exists())
+        assertFalse(context.getDatabasePath(plainName).exists())
+        assertTrue(context.getDatabasePath(encryptedName).exists())
     }
 
     @Test
     fun reopeningWithTheSameKeyKeepsData() = runBlocking {
-        SecureDatabase.open(context, passphrase).apply {
+        open().apply {
             comLinkDao().insertPeer(PeerEntity("dave-device-id-00", "a2V5", "Dave", 0L))
             close()
         }
-        val again = SecureDatabase.open(context, passphrase)
+        val again = open()
         assertEquals("Dave", again.comLinkDao().getPeer("dave-device-id-00")?.contactName)
         again.close()
     }

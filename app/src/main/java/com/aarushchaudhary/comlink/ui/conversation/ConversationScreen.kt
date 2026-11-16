@@ -598,8 +598,18 @@ private fun ImageMessageContent(msg: MessageEntity, accentColor: Color, backgrou
 @Composable
 private fun AudioMessageContent(msg: MessageEntity, accentColor: Color) {
     val context = LocalContext.current
-    var isPlaying by remember { mutableStateOf(false) }
+    // The one player for this bubble; null when nothing is playing
+    var player by remember { mutableStateOf<MediaPlayer?>(null) }
+    val isPlaying = player != null
     val filePath = msg.filePath
+
+    // Leaving the chat (or the bubble scrolling away for good) stops and frees the player
+    DisposableEffect(filePath) {
+        onDispose {
+            player?.release()
+            player = null
+        }
+    }
 
     if (filePath != null && File(filePath).exists()) {
         Row(
@@ -614,28 +624,32 @@ private fun AudioMessageContent(msg: MessageEntity, accentColor: Color) {
                     .size(36.dp)
                     .border(1.dp, accentColor)
                     .clickable {
-                        if (isPlaying) {
-                            isPlaying = false
+                        val current = player
+                        if (current != null) {
+                            // Pause really stops the sound (it used to keep playing)
+                            current.release()
+                            player = null
                         } else {
-                            isPlaying = true
+                            val newPlayer = MediaPlayer()
                             try {
-                                val player = MediaPlayer()
                                 val crypto = (context.applicationContext as ComLinkApp).fileCrypto
                                 val file = File(filePath)
                                 if (crypto.isEncrypted(file)) {
                                     // Decrypted on the fly while playing; no plain copy on disk
-                                    player.setDataSource(DecryptingMediaDataSource(crypto.openSeekable(file)))
+                                    newPlayer.setDataSource(DecryptingMediaDataSource(crypto.openSeekable(file)))
                                 } else {
-                                    player.setDataSource(filePath)
+                                    newPlayer.setDataSource(filePath)
                                 }
-                                player.prepare()
-                                player.setOnCompletionListener {
-                                    isPlaying = false
+                                newPlayer.prepare()
+                                newPlayer.setOnCompletionListener {
                                     it.release()
+                                    if (player === it) player = null
                                 }
-                                player.start()
+                                newPlayer.start()
+                                player = newPlayer
                             } catch (e: Exception) {
-                                isPlaying = false
+                                newPlayer.release()
+                                player = null
                             }
                         }
                     },

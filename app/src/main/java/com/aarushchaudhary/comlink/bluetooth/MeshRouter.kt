@@ -24,6 +24,9 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
     // Callback to send directly to a specific peer (bypasses broadcast for file transfers)
     var sendDirectToNetwork: (suspend (peerId: String, ByteArray, noResponse: Boolean) -> Boolean)? = null
 
+    // Per-neighbour cap on what we relay, so one nearby phone can't make the mesh repeat a flood
+    private val relayLimiter = RelayLimiter()
+
     // LRU Cache to prevent broadcast storms (Max 10,000 envelope IDs)
     private val seenEnvelopes = Collections.synchronizedMap(
         object : LinkedHashMap<String, Boolean>(1000, 0.75f, true) {
@@ -63,6 +66,10 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
             // Capped at MAX_TTL, so a sender can't make an envelope hop (and flood the mesh) forever
             val newTtl = minOf((envelope.ttl ?: 0) - 1, MAX_TTL)
             if (newTtl > 0) {
+                if (!relayLimiter.allow(fromAddress)) {
+                    Log.w("MeshRouter", "Relay limit reached for $fromAddress; dropping")
+                    return
+                }
                 // Rebuild envelope with decremented TTL
                 val relayedEnvelope = envelope.copy(ttl = newTtl)
                 val encodedBytes = relayedEnvelope.encode()

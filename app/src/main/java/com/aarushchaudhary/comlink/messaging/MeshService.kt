@@ -83,8 +83,10 @@ class MeshService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        // Safe to call repeatedly: it only starts Bluetooth once
-        (application as ComLinkApp).bluetoothService.startListening()
+        // Safe to call repeatedly: it only starts Bluetooth once. Waits until the messaging engine
+        // exists (first start after the encryption update), so no incoming message is dropped.
+        val app = application as ComLinkApp
+        app.whenReady { app.bluetoothService.startListening() }
         // If Android kills the process, bring the mesh back when it can
         return START_STICKY
     }

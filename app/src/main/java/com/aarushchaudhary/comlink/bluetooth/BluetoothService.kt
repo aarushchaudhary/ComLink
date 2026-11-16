@@ -127,10 +127,6 @@ class BluetoothService(
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             result?.device?.let { device ->
-                val serviceData = result.scanRecord?.getServiceData(ParcelUuid(SERVICE_UUID))
-                if (serviceData != null) {
-                    addresses.claim(device.address, String(serviceData))
-                }
                 if (!activeGatts.containsKey(device.address)) {
                     connectToDevice(device)
                 }

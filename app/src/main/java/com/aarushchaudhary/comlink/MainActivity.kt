@@ -75,13 +75,16 @@ class MainActivity : ComponentActivity() {
                     // One place for every screen: keeps content clear of the status bar, the
                     // navigation bar, display cutouts and the keyboard (so the chat input stays visible)
                     Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
-                        val onboardingDone by this@MainActivity.dataStore.data
-                            .map { it[onboardingCompletePref] == "true" }
-                            .collectAsState(initial = null)
+                        val onboardingDone by remember {
+                            this@MainActivity.dataStore.data.map { it[onboardingCompletePref] == "true" }
+                        }.collectAsState(initial = null)
+                        // False only on the first start after the encryption update, while the
+                        // chats are moved into the encrypted database in the background
+                        val appReady by (application as ComLinkApp).ready.collectAsState()
 
-                        when (onboardingDone) {
-                            null -> { /* Loading prefs, show nothing */ }
-                            false -> {
+                        when {
+                            onboardingDone == null -> { /* Loading prefs, show nothing */ }
+                            onboardingDone == false -> {
                                 OnboardingScreen(
                                     context = this@MainActivity,
                                     accentColor = MaterialTheme.colorScheme.primary
@@ -89,7 +92,8 @@ class MainActivity : ComponentActivity() {
                                     // onComplete triggers recomposition via datastore
                                 }
                             }
-                            true -> {
+                            !appReady -> SecuringChatsScreen(MaterialTheme.colorScheme.primary)
+                            else -> {
                                 viewModel.startBluetoothIfPermitted()
                                 ComLinkAppUi(viewModel)
                             }
@@ -102,6 +106,28 @@ class MainActivity : ComponentActivity() {
 }
 
 
+
+/** Shown once, on the first start after the encryption update, while the chats are being encrypted. */
+@Composable
+private fun SecuringChatsScreen(accentColor: androidx.compose.ui.graphics.Color) {
+    Column(
+        modifier = Modifier.fillMaxSize().padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        CircularProgressIndicator(color = accentColor)
+        Spacer(Modifier.height(24.dp))
+        Text("> SECURING YOUR CHATS <", color = accentColor, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "Encrypting your messages on this phone. This happens once and keeps every chat.",
+            color = androidx.compose.ui.graphics.Color.LightGray,
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            textAlign = TextAlign.Center
+        )
+    }
+}
 
 sealed class Screen {
     data class MainTabs(val tabIndex: Int = 0) : Screen()
@@ -450,7 +476,7 @@ fun ContactsTab(viewModel: ComLinkViewModel, onNavigateToChat: (String, String) 
                 Text("YOUR QR IDENTITY", color = androidx.compose.ui.graphics.Color.White, fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
                 Spacer(modifier = Modifier.height(32.dp))
                 
-                val myName by context.dataStore.data.map { it[com.aarushchaudhary.comlink.ui.theme.myDisplayNamePref] ?: "Cypherpunk User" }.collectAsState(initial = "Cypherpunk User")
+                val myName by remember { context.dataStore.data.map { it[com.aarushchaudhary.comlink.ui.theme.myDisplayNamePref] ?: "Cypherpunk User" } }.collectAsState(initial = "Cypherpunk User")
                 val qrBitmap = remember(myName) { QrUtils.generateQrBitmap(viewModel.getMyQrPayload(myName)) }
                 Image(bitmap = qrBitmap.asImageBitmap(), contentDescription = "QR Code", modifier = Modifier.size(250.dp).border(2.dp, accentColor))
 

@@ -62,16 +62,16 @@ wire {
 }
 
 dependencies {
-    val composeBomVersion = "2024.06.00"
-    val roomVersion = "2.8.4"
-    val cameraxVersion = "1.4.0"
-    val tinkVersion = "1.9.0"
+    val composeBomVersion = "2026.06.01"
+    val roomVersion = "2.8.5"
+    val cameraxVersion = "1.6.2"
+    val tinkVersion = "1.24.0"
 
     // Core
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
-    implementation("androidx.activity:activity-compose:1.9.0")
-    implementation("androidx.datastore:datastore-preferences:1.1.1")
+    implementation("androidx.core:core-ktx:1.18.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
+    implementation("androidx.activity:activity-compose:1.11.0")
+    implementation("androidx.datastore:datastore-preferences:1.3.0")
     
     // Compose
     implementation(platform("androidx.compose:compose-bom:$composeBomVersion"))
@@ -79,6 +79,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // Material 3 1.4+ no longer brings the icons in by itself (Icons.Default.*, ArrowBack, ...)
+    implementation("androidx.compose.material:material-icons-core")
 
     // Google Tink (Cryptography)
     implementation("com.google.crypto.tink:tink-android:$tinkVersion")
@@ -99,12 +101,14 @@ dependencies {
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
     // ZXing (QR Generation & Parsing)
-    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.google.zxing:core:3.5.4")
 
     // Square Wire (Protobuf): the Wire Gradle plugin adds wire-runtime at its own version
 
     // Tests
     testImplementation("junit:junit:4.13.2")
+    // Real org.json for JVM unit tests (Android's copy is only a stub there)
+    testImplementation("org.json:json:20260814")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test:runner:1.5.2")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
