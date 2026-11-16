@@ -4,6 +4,8 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -58,28 +60,39 @@ class MainActivity : ComponentActivity() {
     private val viewModel: ComLinkViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Android 15+ (target 35+) always draws apps behind the system bars. Do the same on every
+        // version, with light bar icons over the app's black background, and pad the content
+        // below so nothing sits under the bars. Works back to API 21 via AndroidX.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT)
+        )
         super.onCreate(savedInstanceState)
 
         setContent {
             ComLinkTheme(context = this) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    val onboardingDone by this@MainActivity.dataStore.data
-                        .map { it[onboardingCompletePref] == "true" }
-                        .collectAsState(initial = null)
+                    // One place for every screen: keeps content clear of the status bar, the
+                    // navigation bar, display cutouts and the keyboard (so the chat input stays visible)
+                    Box(modifier = Modifier.fillMaxSize().safeDrawingPadding()) {
+                        val onboardingDone by this@MainActivity.dataStore.data
+                            .map { it[onboardingCompletePref] == "true" }
+                            .collectAsState(initial = null)
 
-                    when (onboardingDone) {
-                        null -> { /* Loading prefs, show nothing */ }
-                        false -> {
-                            OnboardingScreen(
-                                context = this@MainActivity,
-                                accentColor = MaterialTheme.colorScheme.primary
-                            ) {
-                                // onComplete triggers recomposition via datastore
+                        when (onboardingDone) {
+                            null -> { /* Loading prefs, show nothing */ }
+                            false -> {
+                                OnboardingScreen(
+                                    context = this@MainActivity,
+                                    accentColor = MaterialTheme.colorScheme.primary
+                                ) {
+                                    // onComplete triggers recomposition via datastore
+                                }
                             }
-                        }
-                        true -> {
-                            viewModel.startBluetoothIfPermitted()
-                            ComLinkAppUi(viewModel)
+                            true -> {
+                                viewModel.startBluetoothIfPermitted()
+                                ComLinkAppUi(viewModel)
+                            }
                         }
                     }
                 }
