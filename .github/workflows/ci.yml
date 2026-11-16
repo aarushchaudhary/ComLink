@@ -1,0 +1,121 @@
+# Builds ComLink and runs every automated test on each push to main and each pull request.
+#   build:        debug + release APKs, unit tests, lint (fails on any lint error, including
+#                 NewApi, which keeps Android 8 working)
+#   device-tests: the instrumented tests on an Android emulator (SQLCipher database move,
+#                 ratchet storage). Runs only once the build job has passed.
+# Bluetooth itself can't be tested here: emulators have no BLE, so mesh tests stay manual.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the run still going
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Same JDK as local builds; the code itself targets Java 17
+  JAVA_VERSION: "25"
+
+jobs:
+  build:
+    name: Build, unit tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # Caches Gradle and its dependencies, and checks the wrapper jar is the genuine one
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build, run unit tests and lint
+        run: ./gradlew assembleDebug assembleRelease testDebugUnitTest assembleDebugAndroidTest lintDebug --stacktrace
+
+      - name: Upload test and lint reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-debug.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: apks
+          path: app/build/outputs/apk/**/*.apk
+          retention-days: 14
+
+  device-tests:
+    name: Device tests (emulator)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      # Hardware acceleration for the emulator on GitHub's Linux runners
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Build the test APKs before the emulator starts, so its time isn't spent compiling
+      - name: Build test APKs
+        run: ./gradlew assembleDebug assembleDebugAndroidTest --stacktrace
+
+      # The app ships arm64 native code only (SQLCipher); x86_64 Google APIs images from
+      # Android 11 on run it through their built-in ARM translation.
+      # Extra RAM: right after boot a small emulator can kill the test process for memory.
+      - name: Run device tests on an emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          ram-size: 4096M
+          disk-size: 6000M
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: ./gradlew connectedDebugAndroidTest --stacktrace
+
+      - name: Upload device test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: device-test-reports
+          path: app/build/reports/androidTests/
+          if-no-files-found: ignore
+          retention-days: 14

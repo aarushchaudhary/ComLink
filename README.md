@@ -3,6 +3,7 @@
 **An offline, end-to-end encrypted Bluetooth mesh messenger for Android.**
 No internet, no SIM, no servers, no accounts. Phones talk to each other over Bluetooth Low Energy, and messages hop from phone to phone until they reach the right person.
 
+[![CI](https://github.com/aarushchaudhary/ComLink/actions/workflows/ci.yml/badge.svg)](https://github.com/aarushchaudhary/ComLink/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-Android%208.0%2B-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Kotlin-Jetpack%20Compose-7F52FF?logo=kotlin&logoColor=white)
 ![Target SDK](https://img.shields.io/badge/target%20SDK-36-blue)
@@ -377,6 +378,17 @@ Full check, as used for every change:
 ./gradlew clean assembleDebug assembleRelease testDebugUnitTest assembleDebugAndroidTest lintDebug
 ```
 
+### Continuous integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push to `main`, on every pull request, and by hand from the **Actions** tab:
+
+| Job | What it does |
+|---|---|
+| **Build, unit tests and lint** | Builds the debug and release APKs and the test APK, runs all unit tests, and runs lint. Any lint error fails the build, including `NewApi`, which keeps Android 8 working. Uploads the test and lint reports and the APKs (kept 14 days). |
+| **Device tests (emulator)** | Once the first job passes: starts an Android 15 emulator (x86_64, Google APIs) and runs the device tests. Uploads their report. |
+
+A newer push to the same branch cancels a run still in progress. The Bluetooth mesh itself can't be tested in CI (emulators have no Bluetooth LE), so the phone checks stay manual.
+
 ---
 
 ## Limitations
@@ -393,7 +405,7 @@ Full check, as used for every change:
 ## Contributing
 
 Issues and pull requests are welcome. Before opening a pull request:
-- run the full check above;
+- run the full check above (CI runs it too, on every pull request);
 - keep Android 8.0 (API 26) working, with lint showing 0 `NewApi` issues;
 - add or update a unit test for any change to the crypto, routing or file transfer code;
 - note any change to the wire format, since it breaks compatibility with older builds.
