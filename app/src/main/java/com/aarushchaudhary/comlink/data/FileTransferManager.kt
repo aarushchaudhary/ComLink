@@ -7,22 +7,14 @@ import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
-import com.aarushchaudhary.comlink.bluetooth.MeshRouter
-import com.aarushchaudhary.comlink.crypto.IdentityManager
-import com.aarushchaudhary.comlink.crypto.SessionCipher
-import com.aarushchaudhary.comlink.proto.Envelope
+import com.aarushchaudhary.comlink.messaging.EncryptedSender
 import com.aarushchaudhary.comlink.proto.FileHeader
 import com.aarushchaudhary.comlink.proto.FilePart
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import okio.ByteString.Companion.toByteString
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.ceil
 
 /**
@@ -37,10 +29,7 @@ import kotlin.math.ceil
 class FileTransferManager(
     private val context: Context,
     private val dao: ComLinkDao,
-    private val identityManager: IdentityManager,
-    private val router: MeshRouter,
-    private val getOrCreateCipher: suspend (String) -> SessionCipher?,
-    private val getPeerLock: (String) -> Mutex
+    private val sender: EncryptedSender
 ) {
 
     companion object {
@@ -123,9 +112,7 @@ class FileTransferManager(
             message_id = messageId
         )
 
-        val headerSent = sendEncryptedPayload(
-            peerId, header.encode(), CONTENT_TYPE_FILE_HEADER, direct = false
-        )
+        val headerSent = sender.send(peerId, header.encode(), contentType = CONTENT_TYPE_FILE_HEADER)
         if (!headerSent) {
             Log.e(TAG, "Failed to send FILE_HEADER for transfer $transferId")
             dao.updateTransferStatus(transferId, "FAILED")
@@ -133,18 +120,13 @@ class FileTransferManager(
         }
 
         // Reserve counters upfront for all parts to avoid per-part lock acquisition
-        val counters = reserveCounters(peerId, partCount) ?: run {
+        val counters = sender.reserveCounters(peerId, partCount) ?: run {
             Log.e(TAG, "Failed to reserve counters for transfer $transferId")
             dao.updateTransferStatus(transferId, "FAILED")
             return false
         }
 
         // Send FILE_PART envelopes sequentially — direct + no-response for speed
-        val cipher = getOrCreateCipher(peerId) ?: run {
-            dao.updateTransferStatus(transferId, "FAILED")
-            return false
-        }
-
         for (i in 0 until partCount) {
             val start = i * PART_SIZE
             val end = minOf(start + PART_SIZE, fileBytes.size)
@@ -156,9 +138,7 @@ class FileTransferManager(
                 data_ = okio.ByteString.of(*partData)
             )
 
-            val partSent = sendEncryptedPayloadFast(
-                peerId, part.encode(), CONTENT_TYPE_FILE_PART, cipher, counters[i]
-            )
+            val partSent = sender.sendReserved(peerId, part.encode(), counters[i], CONTENT_TYPE_FILE_PART)
 
             if (!partSent) {
                 Log.e(TAG, "Failed to send FILE_PART $i/$partCount for transfer $transferId")
@@ -205,13 +185,8 @@ class FileTransferManager(
         dao.updateTransferStatus(transferId, "IN_PROGRESS")
 
         // Reserve counters upfront for all remaining parts
-        val counters = reserveCounters(peerId, remainingParts) ?: run {
+        val counters = sender.reserveCounters(peerId, remainingParts) ?: run {
             Log.e(TAG, "Jumpstart failed to reserve counters for $transferId")
-            dao.updateTransferStatus(transferId, "FAILED")
-            return
-        }
-
-        val cipher = getOrCreateCipher(peerId) ?: run {
             dao.updateTransferStatus(transferId, "FAILED")
             return
         }
@@ -237,9 +212,7 @@ class FileTransferManager(
                 )
 
                 val counterIdx = i - startPart
-                val partSent = sendEncryptedPayloadFast(
-                    peerId, part.encode(), CONTENT_TYPE_FILE_PART, cipher, counters[counterIdx]
-                )
+                val partSent = sender.sendReserved(peerId, part.encode(), counters[counterIdx], CONTENT_TYPE_FILE_PART)
 
                 if (!partSent) {
                     Log.e(TAG, "Jumpstart failed to send FILE_PART $i/$partCount for transfer $transferId")
@@ -415,87 +388,6 @@ class FileTransferManager(
     }
 
     // ─── Helpers ───────────────────────────────────────────────────────
-
-    /**
-     * Reserve N counters upfront under the peer lock in a single acquisition.
-     * Returns an IntArray of [N] counter values, or null on failure.
-     */
-    private suspend fun reserveCounters(peerId: String, count: Int): IntArray? {
-        return getPeerLock(peerId).withLock {
-            val state = dao.getSessionState(peerId) ?: return@withLock null
-            val startCounter = state.myNextCounter
-            dao.updateMyCounter(peerId, startCounter + count)
-            IntArray(count) { startCounter + it }
-        }
-    }
-
-    /**
-     * Encrypt a payload and send it as an Envelope with the given content_type.
-     * Uses a session counter to maintain the monotonic counter requirement.
-     * [direct] controls whether to use targeted send or broadcast.
-     */
-    private suspend fun sendEncryptedPayload(
-        peerId: String,
-        payload: ByteArray,
-        contentType: Int,
-        direct: Boolean = false
-    ): Boolean {
-        return getPeerLock(peerId).withLock {
-            val state = dao.getSessionState(peerId) ?: return@withLock false
-            val cipher = getOrCreateCipher(peerId) ?: return@withLock false
-
-            val counter = state.myNextCounter
-            val ciphertextBytes = cipher.encrypt(payload, counter)
-            val nonceBytes = cipher.constructNonce(counter)
-
-            val envelope = Envelope(
-                sender_id = identityManager.getDeviceId(),
-                recipient_id = peerId,
-                ciphertext = ciphertextBytes.toByteString(),
-                nonce = nonceBytes.toByteString(),
-                timestamp = System.currentTimeMillis(),
-                envelope_id = UUID.randomUUID().toString(),
-                ttl = 10,
-                content_type = contentType
-            )
-
-            dao.updateMyCounter(peerId, counter + 1)
-            if (direct) {
-                router.sendDirectMessage(peerId, envelope, noResponse = false)
-            } else {
-                router.sendLocalMessage(envelope)
-            }
-        }
-    }
-
-    /**
-     * Fast path: encrypt and send a file part using a pre-reserved counter.
-     * Skips peer lock acquisition and uses direct + no-response BLE writes.
-     * Counter must have been reserved upfront via [reserveCounters].
-     */
-    private suspend fun sendEncryptedPayloadFast(
-        peerId: String,
-        payload: ByteArray,
-        contentType: Int,
-        cipher: SessionCipher,
-        counter: Int
-    ): Boolean {
-        val ciphertextBytes = cipher.encrypt(payload, counter)
-        val nonceBytes = cipher.constructNonce(counter)
-
-        val envelope = Envelope(
-            sender_id = identityManager.getDeviceId(),
-            recipient_id = peerId,
-            ciphertext = ciphertextBytes.toByteString(),
-            nonce = nonceBytes.toByteString(),
-            timestamp = System.currentTimeMillis(),
-            envelope_id = UUID.randomUUID().toString(),
-            ttl = 10,
-            content_type = contentType
-        )
-
-        return router.sendDirectMessage(peerId, envelope, noResponse = true)
-    }
 
     private fun getTransferTempDir(transferId: String): File {
         return File(context.cacheDir, "transfers/$transferId")

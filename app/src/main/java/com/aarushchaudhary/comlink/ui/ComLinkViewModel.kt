@@ -11,16 +11,15 @@ import com.aarushchaudhary.comlink.data.FileTransferManager
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
 import com.aarushchaudhary.comlink.data.SessionStateEntity
+import com.aarushchaudhary.comlink.messaging.EncryptedSender
+import com.aarushchaudhary.comlink.messaging.buildReplyPayload
 import com.aarushchaudhary.comlink.proto.Envelope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
-import okio.ByteString.Companion.toByteString
 import java.util.UUID
 
 import kotlinx.coroutines.isActive
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 
 class ComLinkViewModel(application: Application) : AndroidViewModel(application) {
@@ -36,10 +35,10 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
 
     val peers: Flow<List<PeerEntity>> = dao.getAllPeers()
 
-    private val peerLocks = ConcurrentHashMap<String, Mutex>()
     private val sessionCiphers = ConcurrentHashMap<String, SessionCipher>()
 
-    private fun getPeerLock(peerId: String) = peerLocks.getOrPut(peerId) { Mutex() }
+    // Contacts with a resend already running, so overlapping triggers don't run it twice
+    private val resendInFlight = ConcurrentHashMap.newKeySet<String>()
 
     private suspend fun getOrCreateCipher(peerId: String): SessionCipher? {
         return sessionCiphers.getOrPut(peerId) {
@@ -49,15 +48,24 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    // FileTransferManager — initialized once, uses our cipher/lock callbacks
+    // Every outgoing envelope goes through this one sender (it owns the per-contact locks)
+    private val sender = EncryptedSender(
+        localDeviceId = identity.getDeviceId(),
+        loadCounter = { peerId -> dao.getSessionState(peerId)?.myNextCounter },
+        saveCounter = { peerId, next -> dao.updateMyCounter(peerId, next) },
+        cipherFor = { peerId -> getOrCreateCipher(peerId) },
+        transmit = { envelope, direct, noResponse ->
+            if (direct) router.sendDirectMessage(envelope.recipient_id, envelope, noResponse)
+            else router.sendLocalMessage(envelope)
+        }
+    )
+
+    // FileTransferManager — initialized once, sends through the shared sender
     val fileTransferManager: FileTransferManager by lazy {
         FileTransferManager(
             context = app,
             dao = dao,
-            identityManager = identity,
-            router = router,
-            getOrCreateCipher = { peerId -> getOrCreateCipher(peerId) },
-            getPeerLock = { peerId -> getPeerLock(peerId) }
+            sender = sender
         ).also { app.fileTransferManager = it }
     }
 
@@ -110,49 +118,26 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         }
     }
     
-    private fun resendPendingMessages(peerId: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val pending = dao.getPendingMessages(peerId)
-            if (pending.isEmpty()) return@launch
-            
-            val state = dao.getSessionState(peerId) ?: return@launch
-            val cipher = getOrCreateCipher(peerId) ?: return@launch
-            
-            var currentCounter = state.myNextCounter
-            
-            for (msg in pending) {
-                // Skip file messages — they have their own transfer logic
-                if (msg.messageType != "TEXT") continue
+    /** The plaintext to (re)send for a stored outgoing text or location message. */
+    private fun outgoingPayload(msg: MessageEntity): ByteArray {
+        val base = if (msg.messageType == "LOCATION") "LOCATION:${msg.plaintext}" else msg.plaintext
+        return buildReplyPayload(base, msg.replyToMessageId, msg.replyToSenderId, msg.replyToTextSnippet)
+            .toByteArray(Charsets.UTF_8)
+    }
 
-                var finalPayload = msg.plaintext
-                if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
-                    val json = org.json.JSONObject()
-                    json.put("text", msg.plaintext)
-                    msg.replyToMessageId?.let { json.put("replyId", it) }
-                    msg.replyToSenderId?.let { json.put("replySender", it) }
-                    msg.replyToTextSnippet?.let { json.put("replySnippet", it) }
-                    finalPayload = json.toString()
-                }
-                
-                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), currentCounter)
-                val nonceBytes = cipher.constructNonce(currentCounter)
-                val envelope = Envelope(
-                    sender_id = identity.getDeviceId(),
-                    recipient_id = peerId,
-                    ciphertext = ciphertextBytes.toByteString(),
-                    nonce = nonceBytes.toByteString(),
-                    timestamp = msg.timestamp,
-                    envelope_id = msg.messageId,
-                    ttl = 10
-                )
-                currentCounter++
-                val success = router.sendLocalMessage(envelope)
-                if (success) {
+    private fun resendPendingMessages(peerId: String) {
+        // Heartbeats, HELLOs and the 30 s loop all trigger this; run at most one per contact at a time
+        if (!resendInFlight.add(peerId)) return
+        viewModelScope.launch(Dispatchers.IO) {
+            for (msg in dao.getPendingMessages(peerId)) {
+                // File messages have their own transfer logic
+                if (msg.messageType != "TEXT" && msg.messageType != "LOCATION") continue
+                val sent = sender.send(peerId, outgoingPayload(msg), envelopeId = msg.messageId, timestamp = msg.timestamp)
+                if (sent) {
                     dao.updateMessageStatus(msg.messageId, 1)
                 }
             }
-            dao.updateMyCounter(peerId, currentCounter)
-        }
+        }.invokeOnCompletion { resendInFlight.remove(peerId) }
     }
 
     /**
@@ -192,43 +177,9 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             }
 
             // 2. Retry standard text / location messages
-            getPeerLock(peerId).withLock {
-                val state = dao.getSessionState(peerId) ?: return@withLock
-                val cipher = getOrCreateCipher(peerId) ?: return@withLock
-
-                val counter = state.myNextCounter
-                
-                var basePlaintext = msg.plaintext
-                if (msg.messageType == "LOCATION") {
-                    basePlaintext = "LOCATION:${msg.plaintext}"
-                }
-                
-                var finalPayload = basePlaintext
-                if (msg.replyToMessageId != null || msg.replyToSenderId != null || msg.replyToTextSnippet != null) {
-                    val json = org.json.JSONObject()
-                    json.put("text", basePlaintext)
-                    msg.replyToMessageId?.let { json.put("replyId", it) }
-                    msg.replyToSenderId?.let { json.put("replySender", it) }
-                    msg.replyToTextSnippet?.let { json.put("replySnippet", it) }
-                    finalPayload = json.toString()
-                }
-
-                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
-                val nonceBytes = cipher.constructNonce(counter)
-                val envelope = Envelope(
-                    sender_id = identity.getDeviceId(),
-                    recipient_id = peerId,
-                    ciphertext = ciphertextBytes.toByteString(),
-                    nonce = nonceBytes.toByteString(),
-                    timestamp = msg.timestamp,
-                    envelope_id = msg.messageId,
-                    ttl = 10
-                )
-                dao.updateMyCounter(peerId, counter + 1)
-                val success = router.sendLocalMessage(envelope)
-                if (success) {
-                    dao.updateMessageStatus(msg.messageId, 1)
-                }
+            val sent = sender.send(peerId, outgoingPayload(msg), envelopeId = msg.messageId, timestamp = msg.timestamp)
+            if (sent) {
+                dao.updateMessageStatus(msg.messageId, 1)
             }
         }
     }
@@ -326,56 +277,25 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         replyToSnippet: String? = null
     ) {
         viewModelScope.launch(Dispatchers.IO) {
-            getPeerLock(peerId).withLock {
-            val state = dao.getSessionState(peerId) ?: return@withLock
-            val cipher = getOrCreateCipher(peerId) ?: return@withLock
-            
-            val counter = state.myNextCounter
-            
-            var finalPayload = plaintext
-            if (replyToId != null || replyToSender != null || replyToSnippet != null) {
-                val json = org.json.JSONObject()
-                json.put("text", plaintext)
-                replyToId?.let { json.put("replyId", it) }
-                replyToSender?.let { json.put("replySender", it) }
-                replyToSnippet?.let { json.put("replySnippet", it) }
-                finalPayload = json.toString()
-            }
-            
-            val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
-            val nonceBytes = cipher.constructNonce(counter)
-            
-            val envId = UUID.randomUUID().toString()
-            
-            val envelope = Envelope(
-                sender_id = identity.getDeviceId(),
-                recipient_id = peerId,
-                ciphertext = ciphertextBytes.toByteString(),
-                nonce = nonceBytes.toByteString(),
-                timestamp = System.currentTimeMillis(),
-                envelope_id = envId,
-                ttl = 10 // Max 10 hops
-            )
-            
-            dao.updateMyCounter(peerId, counter + 1)
-            
+            // No session yet (contact not set up): nothing is stored or sent, as before
+            dao.getSessionState(peerId) ?: return@launch
+
             val msgEntity = MessageEntity(
-                messageId = envId,
+                messageId = UUID.randomUUID().toString(),
                 deviceId = peerId,
                 isFromMe = true,
                 plaintext = plaintext,
-                timestamp = envelope.timestamp ?: System.currentTimeMillis(),
+                timestamp = System.currentTimeMillis(),
                 replyToMessageId = replyToId,
                 replyToSenderId = replyToSender,
                 replyToTextSnippet = replyToSnippet
             )
             dao.insertMessage(msgEntity)
             dao.updatePeerLastMessageTime(peerId, msgEntity.timestamp)
-            
-            val success = router.sendLocalMessage(envelope)
-            if (success) {
-                dao.updateMessageStatus(envId, 1)
-            }
+
+            val sent = sender.send(peerId, outgoingPayload(msgEntity), envelopeId = msgEntity.messageId, timestamp = msgEntity.timestamp)
+            if (sent) {
+                dao.updateMessageStatus(msgEntity.messageId, 1)
             }
         }
     }
@@ -439,59 +359,28 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         replyToSender: String? = null,
         replyToSnippet: String? = null
     ) {
-        val plaintext = "LOCATION:$lat,$lon"
         viewModelScope.launch(Dispatchers.IO) {
-            getPeerLock(peerId).withLock {
-                val state = dao.getSessionState(peerId) ?: return@withLock
-                val cipher = getOrCreateCipher(peerId) ?: return@withLock
-                
-                val counter = state.myNextCounter
-                
-                var finalPayload = plaintext
-                if (replyToId != null || replyToSender != null || replyToSnippet != null) {
-                    val json = org.json.JSONObject()
-                    json.put("text", plaintext)
-                    replyToId?.let { json.put("replyId", it) }
-                    replyToSender?.let { json.put("replySender", it) }
-                    replyToSnippet?.let { json.put("replySnippet", it) }
-                    finalPayload = json.toString()
-                }
-                
-                val ciphertextBytes = cipher.encrypt(finalPayload.toByteArray(Charsets.UTF_8), counter)
-                val nonceBytes = cipher.constructNonce(counter)
-                
-                val envId = UUID.randomUUID().toString()
-                
-                val envelope = Envelope(
-                    sender_id = identity.getDeviceId(),
-                    recipient_id = peerId,
-                    ciphertext = ciphertextBytes.toByteString(),
-                    nonce = nonceBytes.toByteString(),
-                    timestamp = System.currentTimeMillis(),
-                    envelope_id = envId,
-                    ttl = 10
-                )
-                
-                dao.updateMyCounter(peerId, counter + 1)
-                
-                val msgEntity = MessageEntity(
-                    messageId = envId,
-                    deviceId = peerId,
-                    isFromMe = true,
-                    plaintext = "$lat,$lon",
-                    timestamp = envelope.timestamp ?: System.currentTimeMillis(),
-                    replyToMessageId = replyToId,
-                    replyToSenderId = replyToSender,
-                    replyToTextSnippet = replyToSnippet,
-                    messageType = "LOCATION"
-                )
-                dao.insertMessage(msgEntity)
-                dao.updatePeerLastMessageTime(peerId, msgEntity.timestamp)
-                
-                val success = router.sendLocalMessage(envelope)
-                if (success) {
-                    dao.updateMessageStatus(envId, 1)
-                }
+            // No session yet (contact not set up): nothing is stored or sent, as before
+            dao.getSessionState(peerId) ?: return@launch
+
+            val msgEntity = MessageEntity(
+                messageId = UUID.randomUUID().toString(),
+                deviceId = peerId,
+                isFromMe = true,
+                plaintext = "$lat,$lon",
+                timestamp = System.currentTimeMillis(),
+                replyToMessageId = replyToId,
+                replyToSenderId = replyToSender,
+                replyToTextSnippet = replyToSnippet,
+                messageType = "LOCATION"
+            )
+            dao.insertMessage(msgEntity)
+            dao.updatePeerLastMessageTime(peerId, msgEntity.timestamp)
+
+            // outgoingPayload adds the "LOCATION:" prefix the receiver looks for
+            val sent = sender.send(peerId, outgoingPayload(msgEntity), envelopeId = msgEntity.messageId, timestamp = msgEntity.timestamp)
+            if (sent) {
+                dao.updateMessageStatus(msgEntity.messageId, 1)
             }
         }
     }
@@ -598,27 +487,7 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
     
     private fun sendAck(peerId: String, messageId: String) {
         viewModelScope.launch(Dispatchers.IO) {
-            getPeerLock(peerId).withLock {
-            val state = dao.getSessionState(peerId) ?: return@withLock
-            val cipher = getOrCreateCipher(peerId) ?: return@withLock
-            
-            val counter = state.myNextCounter
-            val ciphertextBytes = cipher.encrypt("ACK:$messageId".toByteArray(Charsets.UTF_8), counter)
-            val nonceBytes = cipher.constructNonce(counter)
-            
-            val envelope = Envelope(
-                sender_id = identity.getDeviceId(),
-                recipient_id = peerId,
-                ciphertext = ciphertextBytes.toByteString(),
-                nonce = nonceBytes.toByteString(),
-                timestamp = System.currentTimeMillis(),
-                envelope_id = UUID.randomUUID().toString(),
-                ttl = 10
-            )
-            
-            dao.updateMyCounter(peerId, counter + 1)
-            router.sendLocalMessage(envelope)
-            }
+            sender.send(peerId, "ACK:$messageId".toByteArray(Charsets.UTF_8))
         }
     }
 
@@ -631,27 +500,8 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
             dao.markIncomingMessagesAsRead(peerId)
 
             // Send READ receipts for each unread message
-            getPeerLock(peerId).withLock {
-                val state = dao.getSessionState(peerId) ?: return@withLock
-                val cipher = getOrCreateCipher(peerId) ?: return@withLock
-                var counter = state.myNextCounter
-
-                for (msg in unread) {
-                    val ciphertextBytes = cipher.encrypt("READ:${msg.messageId}".toByteArray(Charsets.UTF_8), counter)
-                    val nonceBytes = cipher.constructNonce(counter)
-                    val envelope = Envelope(
-                        sender_id = identity.getDeviceId(),
-                        recipient_id = peerId,
-                        ciphertext = ciphertextBytes.toByteString(),
-                        nonce = nonceBytes.toByteString(),
-                        timestamp = System.currentTimeMillis(),
-                        envelope_id = UUID.randomUUID().toString(),
-                        ttl = 10
-                    )
-                    counter++
-                    router.sendLocalMessage(envelope)
-                }
-                dao.updateMyCounter(peerId, counter)
+            for (msg in unread) {
+                sender.send(peerId, "READ:${msg.messageId}".toByteArray(Charsets.UTF_8))
             }
         }
     }
