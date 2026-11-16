@@ -47,19 +47,45 @@ class SessionCipher(
         }
     }
 
+    companion object {
+        /**
+         * The envelope header fields bound to the ciphertext as AES-GCM AAD (additional authenticated
+         * data): changing any of them makes decryption fail. `ttl` is left out because relays change it.
+         * Each string is length-prefixed, so field boundaries can't be shifted.
+         */
+        fun envelopeAad(
+            senderId: String,
+            recipientId: String,
+            envelopeId: String,
+            contentType: Int,
+            timestamp: Long
+        ): ByteArray {
+            val fields = listOf(senderId, recipientId, envelopeId).map { it.toByteArray(Charsets.UTF_8) }
+            val buffer = ByteBuffer.allocate(AAD_LABEL.size + fields.sumOf { 4 + it.size } + 4 + 8)
+            buffer.put(AAD_LABEL)
+            fields.forEach { buffer.putInt(it.size).put(it) }
+            buffer.putInt(contentType).putLong(timestamp)
+            return buffer.array()
+        }
+
+        private val AAD_LABEL = "ComLink-envelope-v1".toByteArray(Charsets.UTF_8)
+    }
+
     /**
      * Encrypts plaintext using AES-256-GCM with a strict 96-bit deterministic nonce.
      * @param plaintext The message to encrypt
      * @param counter A 24-bit (3-byte) strictly monotonically increasing counter for this session
+     * @param aad The envelope header from [envelopeAad]; the receiver must pass the same bytes
      */
-    fun encrypt(plaintext: ByteArray, counter: Int): ByteArray {
+    fun encrypt(plaintext: ByteArray, counter: Int, aad: ByteArray): ByteArray {
         val nonce = constructNonce(counter)
-        
+
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         val spec = GCMParameterSpec(128, nonce) // 128-bit authentication tag
         val keySpec = SecretKeySpec(sessionKey, "AES")
-        
+
         cipher.init(Cipher.ENCRYPT_MODE, keySpec, spec)
+        cipher.updateAAD(aad)
         return cipher.doFinal(plaintext)
     }
 
@@ -67,9 +93,10 @@ class SessionCipher(
      * Decrypts ciphertext using AES-256-GCM.
      * @param ciphertext The encrypted payload
      * @param nonce The 12-byte (96-bit) nonce received over the network
+     * @param aad The received envelope's header from [envelopeAad]; any change fails the tag check
      * @return A Pair containing the decrypted plaintext and the extracted counter
      */
-    fun decrypt(ciphertext: ByteArray, nonce: ByteArray): Pair<ByteArray, Int> {
+    fun decrypt(ciphertext: ByteArray, nonce: ByteArray, aad: ByteArray): Pair<ByteArray, Int> {
         if (nonce.size != 12) {
             throw IllegalArgumentException("Nonce must be exactly 12 bytes")
         }
@@ -94,6 +121,7 @@ class SessionCipher(
         val keySpec = SecretKeySpec(sessionKey, "AES")
         
         cipher.init(Cipher.DECRYPT_MODE, keySpec, spec)
+        cipher.updateAAD(aad)
         return Pair(cipher.doFinal(ciphertext), counter)
     }
 

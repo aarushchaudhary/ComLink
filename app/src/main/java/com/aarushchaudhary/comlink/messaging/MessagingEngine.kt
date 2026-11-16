@@ -3,6 +3,7 @@ package com.aarushchaudhary.comlink.messaging
 import android.net.Uri
 import android.util.Base64
 import com.aarushchaudhary.comlink.ComLinkApp
+import com.aarushchaudhary.comlink.crypto.ContactQr
 import com.aarushchaudhary.comlink.crypto.ReplayWindow
 import com.aarushchaudhary.comlink.crypto.SessionCipher
 import com.aarushchaudhary.comlink.data.FileTransferManager
@@ -176,28 +177,13 @@ class MessagingEngine(
     fun processScannedQr(qrData: String, contactName: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                // If it's old format "devId:pubKey"
-                val parts = qrData.split(":")
-                var peerDeviceId = ""
-                var peerPubKey = ""
-                var exchangedName = ""
-                
-                if (parts.size >= 2) {
-                    peerDeviceId = parts[0]
-                    peerPubKey = parts[1]
-                } else {
-                    // Try parsing as protobuf ContactPayload base64
-                    try {
-                        val bytes = Base64.decode(qrData, Base64.NO_WRAP)
-                        val payload = com.aarushchaudhary.comlink.proto.ContactPayload.ADAPTER.decode(bytes)
-                        peerDeviceId = payload.device_id
-                        peerPubKey = payload.public_key
-                        exchangedName = payload.display_name
-                    } catch (e: Exception) {
-                        return@launch
-                    }
-                }
-                
+                // Current protobuf format or old "devId:pubKey"; anything without a valid
+                // 32-byte key (a URL, a random QR) is ignored instead of becoming a junk contact
+                val contact = ContactQr.parse(qrData) ?: return@launch
+                val peerDeviceId = contact.deviceId
+                val peerPubKey = contact.publicKeyBase64
+                val exchangedName = contact.displayName
+
                 val existing = dao.getPeer(peerDeviceId)
                 if (existing == null) {
                     dao.insertPeer(PeerEntity(peerDeviceId, peerPubKey, contactName, exchangedName = exchangedName))
@@ -373,7 +359,12 @@ class MessagingEngine(
                 val ciphertext = envelope.ciphertext?.toByteArray() ?: return
                 val nonceBytes = envelope.nonce?.toByteArray() ?: return
 
-                val (decryptedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes)
+                // The header as received: if a relay changed any of these fields, the tag check fails
+                val aad = SessionCipher.envelopeAad(
+                    envelope.sender_id, envelope.recipient_id, envelope.envelope_id,
+                    envelope.content_type, envelope.timestamp
+                )
+                val (decryptedBytes, counter) = cipher.decrypt(ciphertext, nonceBytes, aad)
 
                 // Replay protection: accept new counters and unseen ones inside the last 256,
                 // so messages that arrive out of order through the mesh aren't dropped

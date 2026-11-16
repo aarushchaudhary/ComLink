@@ -9,6 +9,11 @@ import kotlinx.coroutines.launch
 
 class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
 
+    companion object {
+        /** Most hops a relayed envelope may still make; our own messages start at 10 too. */
+        const val MAX_TTL = 10
+    }
+
     // Listener for messages that are destined for this device
     var onMessageReceived: ((Envelope) -> Unit)? = null
     
@@ -53,7 +58,8 @@ class MeshRouter(val localDeviceId: String, private val scope: CoroutineScope) {
         } else {
             // 3. Multi-hop Relay Logic
             // We never attempt to decrypt ciphertext if we are not the recipient
-            val newTtl = (envelope.ttl ?: 0) - 1
+            // Capped at MAX_TTL, so a sender can't make an envelope hop (and flood the mesh) forever
+            val newTtl = minOf((envelope.ttl ?: 0) - 1, MAX_TTL)
             if (newTtl > 0) {
                 // Rebuild envelope with decremented TTL
                 val relayedEnvelope = envelope.copy(ttl = newTtl)

@@ -87,6 +87,41 @@ class EncryptedSenderTest {
     }
 
     @Test
+    fun receiverDecryptsAndDetectsATamperedHeader() = runBlocking {
+        val alicePriv = X25519.generatePrivateKey()
+        val bobPriv = X25519.generatePrivateKey()
+        val alicePub = X25519.publicFromPrivate(alicePriv)
+        val bobPub = X25519.publicFromPrivate(bobPriv)
+        val aliceToBob = SessionCipher(alicePriv, alicePub, bobPub)
+        val bobFromAlice = SessionCipher(bobPriv, bobPub, alicePub)
+
+        val sender = EncryptedSender(
+            localDeviceId = "alice",
+            loadCounter = { 0 },
+            saveCounter = { _, _ -> },
+            cipherFor = { aliceToBob },
+            transmit = { envelope, _, _ -> sent.add(envelope); true }
+        )
+        assertTrue(sender.send(peer, "hi bob".toByteArray(), contentType = 0))
+        val e = sent.single()
+
+        fun open(env: Envelope) = bobFromAlice.decrypt(
+            env.ciphertext.toByteArray(), env.nonce.toByteArray(),
+            SessionCipher.envelopeAad(env.sender_id, env.recipient_id, env.envelope_id, env.content_type, env.timestamp)
+        ).first
+
+        assertEquals("hi bob", String(open(e)))
+        // A relay may lower ttl: still fine
+        assertEquals("hi bob", String(open(e.copy(ttl = 3))))
+        // A relay flipping the content type (text -> file part) is caught
+        try {
+            open(e.copy(content_type = 2))
+            org.junit.Assert.fail("tampered content_type must not decrypt")
+        } catch (expected: javax.crypto.AEADBadTagException) {
+        }
+    }
+
+    @Test
     fun noSessionMeansNothingIsSent() = runBlocking {
         val sender = newSender(hasSession = false)
         assertFalse(sender.send(peer, "hi".toByteArray()))

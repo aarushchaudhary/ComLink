@@ -89,14 +89,18 @@ class EncryptedSender(
         contentType: Int,
         envelopeId: String,
         timestamp: Long
-    ): Envelope = Envelope(
-        sender_id = localDeviceId,
-        recipient_id = peerId,
-        ciphertext = cipher.encrypt(plaintext, counter).toByteString(),
-        nonce = cipher.constructNonce(counter).toByteString(),
-        timestamp = timestamp,
-        envelope_id = envelopeId,
-        ttl = DEFAULT_TTL,
-        content_type = contentType
-    )
+    ): Envelope {
+        // Header fields are bound to the ciphertext: a relay that changes any of them breaks decryption
+        val aad = SessionCipher.envelopeAad(localDeviceId, peerId, envelopeId, contentType, timestamp)
+        return Envelope(
+            sender_id = localDeviceId,
+            recipient_id = peerId,
+            ciphertext = cipher.encrypt(plaintext, counter, aad).toByteString(),
+            nonce = cipher.constructNonce(counter).toByteString(),
+            timestamp = timestamp,
+            envelope_id = envelopeId,
+            ttl = DEFAULT_TTL,
+            content_type = contentType
+        )
+    }
 }

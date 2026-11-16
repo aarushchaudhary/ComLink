@@ -6,6 +6,7 @@ import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aarushchaudhary.comlink.ComLinkApp
+import com.aarushchaudhary.comlink.crypto.ContactQr
 import com.aarushchaudhary.comlink.data.MessageEntity
 import com.aarushchaudhary.comlink.data.PeerEntity
 import com.aarushchaudhary.comlink.messaging.MeshService
@@ -77,9 +78,14 @@ class ComLinkViewModel(application: Application) : AndroidViewModel(application)
         return Base64.encodeToString(com.aarushchaudhary.comlink.proto.ContactPayload.ADAPTER.encode(payload), Base64.NO_WRAP)
     }
 
-    fun generateFingerprint(peerPubKeyBase64: String): String {
+    /**
+     * Fingerprint for the scan dialog. [scannedText] is the whole QR (current format) or just the
+     * key part (old "deviceId:key" format); both give the same fingerprint for the same key.
+     * Shows "ERROR" when there's no valid 32-byte key, instead of a fingerprint of the wrong bytes.
+     */
+    fun generateFingerprint(scannedText: String): String {
+        val peerPubKey = ContactQr.publicKeyFrom(scannedText) ?: return "ERROR"
         return try {
-            val peerPubKey = Base64.decode(peerPubKeyBase64, Base64.NO_WRAP)
             identity.generateFingerprint(peerPubKey)
         } catch (e: Exception) {
             "ERROR"
