@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <files-path name="received_files" path="received_files/" />
-    <cache-path name="transfers" path="transfers/" />
-    <files-path name="thumbnails" path="thumbnails/" />
+    <!-- Only temporary decrypted copies are ever shared with other apps (opening a document or video).
+         Stored files are encrypted and never exposed. The folder is cleared on every app start. -->
+    <cache-path name="shared" path="shared/" />
 </paths>

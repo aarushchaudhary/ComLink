@@ -1,15 +1,17 @@
 package com.aarushchaudhary.comlink
 
 import android.app.Application
-import androidx.room.Room
 import com.aarushchaudhary.comlink.bluetooth.BluetoothService
 import com.aarushchaudhary.comlink.bluetooth.MeshRouter
 import com.aarushchaudhary.comlink.crypto.IdentityManager
 import com.aarushchaudhary.comlink.data.ComLinkDatabase
+import com.aarushchaudhary.comlink.data.FileCrypto
+import com.aarushchaudhary.comlink.data.SecureDatabase
 import com.aarushchaudhary.comlink.messaging.MessagingEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.io.File
 
 class ComLinkApp : Application() {
 
@@ -29,18 +31,27 @@ class ComLinkApp : Application() {
     lateinit var messagingEngine: MessagingEngine
         private set
 
+    // Encrypts and decrypts every stored file (received files, sent copies, thumbnails, parts)
+    lateinit var fileCrypto: FileCrypto
+        private set
+
+    /** Temporary decrypted copies handed to other apps (open a document, play a video). */
+    val shareCacheDir: File get() = File(cacheDir, "shared")
+
     private val appScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     override fun onCreate() {
         super.onCreate()
 
-        database = Room.databaseBuilder(
-            this,
-            ComLinkDatabase::class.java,
-            "comlink_db"
-        ).build()
-
+        // The identity holds the keys, so it comes first
         identityManager = IdentityManager(this)
+
+        // SQLCipher-encrypted database; a pre-encryption database is moved over once, verified
+        database = SecureDatabase.open(this, identityManager.databasePassphrase())
+
+        fileCrypto = FileCrypto(identityManager.fileStreamingAead())
+        // Decrypted copies only live until the next start
+        shareCacheDir.deleteRecursively()
 
         meshRouter = MeshRouter(identityManager.getDeviceId(), appScope)
 

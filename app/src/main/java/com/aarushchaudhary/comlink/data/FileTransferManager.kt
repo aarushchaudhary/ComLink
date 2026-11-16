@@ -21,8 +21,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.io.RandomAccessFile
 import java.util.UUID
 
 /**
@@ -38,7 +36,8 @@ class FileTransferManager(
     private val context: Context,
     private val dao: ComLinkDao,
     private val sender: EncryptedSender,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val crypto: FileCrypto
 ) {
 
     companion object {
@@ -177,14 +176,15 @@ class FileTransferManager(
                 peerDeviceId = peerId,
                 fileName = message.fileName ?: file.name,
                 mimeType = message.fileMimeType ?: "application/octet-stream",
-                fileSize = file.length(),
-                partCount = TransferChecks.expectedPartCount(file.length()),
+                fileSize = crypto.plainSize(file),
+                partCount = TransferChecks.expectedPartCount(crypto.plainSize(file)),
                 isOutgoing = true
             ).also { dao.insertFileTransfer(it) }
 
         val thumbnailBytes = message.thumbnailPath?.let { File(it) }
-            ?.takeIf { it.exists() && it.length() <= TransferChecks.MAX_THUMBNAIL_BYTES }
-            ?.readBytes()
+            ?.takeIf { it.exists() }
+            ?.let { runCatching { crypto.readBytes(it) }.getOrNull() }
+            ?.takeIf { it.size <= TransferChecks.MAX_THUMBNAIL_BYTES }
 
         withActiveTransfer(transfer.transferId) {
             dao.updateTransferStatus(transfer.transferId, "IN_PROGRESS")
@@ -317,17 +317,24 @@ class FileTransferManager(
             Log.e(TAG, "Failed to reserve counters for transfer $transferId")
             return false
         }
-        val raf = try { RandomAccessFile(filePath, "r") } catch (e: Exception) {
+        val size: Long // plaintext size
+        val channel = try {
+            size = crypto.plainSize(File(filePath))
+            crypto.openSeekable(File(filePath))
+        } catch (e: Exception) {
             Log.e(TAG, "Cannot open local copy for transfer $transferId: $filePath", e)
             return false
         }
-        raf.use {
+        channel.use {
             parts.forEachIndexed { n, i ->
                 val start = i.toLong() * PART_SIZE
-                val end = minOf(start + PART_SIZE, raf.length())
-                val partData = ByteArray((end - start).toInt())
-                raf.seek(start)
-                raf.readFully(partData)
+                val end = minOf(start + PART_SIZE, size)
+                val buffer = java.nio.ByteBuffer.allocate((end - start).toInt())
+                channel.position(start)
+                while (buffer.hasRemaining()) {
+                    if (channel.read(buffer) < 0) throw java.io.EOFException("Local copy of $transferId ended early")
+                }
+                val partData = buffer.array()
 
                 val part = FilePart(transfer_id = transferId, part_index = i, data_ = okio.ByteString.of(*partData))
                 if (!sender.sendReserved(peerId, part.encode(), counters[n], CONTENT_TYPE_FILE_PART)) {
@@ -555,10 +562,10 @@ class FileTransferManager(
         }
 
         // Write part to disk
-        val partFile = File(getTransferTempDir(transferId), "part_$partIndex")
+        val partFile = partFile(transferId, partIndex)
         partFile.parentFile?.mkdirs()
         val alreadyExisted = partFile.exists()
-        partFile.writeBytes(partBytes)
+        crypto.write(partFile, partBytes)
 
         if (!alreadyExisted) {
             dao.incrementReceivedParts(transferId)
@@ -595,11 +602,14 @@ class FileTransferManager(
                 null // we'll write manually from parts
             )
 
-            FileOutputStream(outputFile).use { out ->
+            var written = 0L
+            crypto.openWrite(outputFile).use { out ->
                 for (i in 0 until transfer.partCount) {
-                    val partFile = File(getTransferTempDir(transfer.transferId), "part_$i")
+                    val partFile = partFile(transfer.transferId, i)
                     if (partFile.exists()) {
-                        out.write(partFile.readBytes())
+                        val bytes = crypto.readBytes(partFile)
+                        out.write(bytes)
+                        written += bytes.size
                     } else {
                         Log.e(TAG, "Missing part $i for transfer ${transfer.transferId}")
                         dao.updateTransferStatus(transfer.transferId, "FAILED")
@@ -609,8 +619,8 @@ class FileTransferManager(
             }
 
             // The parts must add up to exactly the size the header announced
-            if (outputFile.length() != transfer.fileSize) {
-                Log.e(TAG, "Size mismatch for ${transfer.transferId}: got ${outputFile.length()}, expected ${transfer.fileSize}")
+            if (written != transfer.fileSize) {
+                Log.e(TAG, "Size mismatch for ${transfer.transferId}: got $written, expected ${transfer.fileSize}")
                 outputFile.delete()
                 dao.updateTransferStatus(transfer.transferId, "FAILED")
                 return
@@ -625,7 +635,7 @@ class FileTransferManager(
             // Confirm to the sender, so it can show Delivered and stop resending
             reportStatus(transfer.copy(status = "COMPLETE"))
 
-            Log.d(TAG, "File assembled: ${outputFile.absolutePath} (${outputFile.length()} bytes)")
+            Log.d(TAG, "File assembled: ${outputFile.absolutePath} ($written bytes)")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to assemble file for transfer ${transfer.transferId}", e)
@@ -700,7 +710,7 @@ class FileTransferManager(
 
     /** Part indexes already on disk for an incoming transfer. */
     private fun heldParts(transfer: FileTransferEntity): List<Int> =
-        (0 until transfer.partCount).filter { File(getTransferTempDir(transfer.transferId), "part_$it").exists() }
+        (0 until transfer.partCount).filter { partFile(transfer.transferId, it).exists() }
 
     // ─── Helpers ───────────────────────────────────────────────────────
 
@@ -708,12 +718,17 @@ class FileTransferManager(
         return File(context.cacheDir, "transfers/$transferId")
     }
 
+    /** A received part, encrypted while it waits for the rest. */
+    private fun partFile(transferId: String, index: Int): File =
+        File(getTransferTempDir(transferId), crypto.encryptedName("part_$index"))
+
+    /** Our stored copy of a file (sent or received), always encrypted. [data] null = written later. */
     private fun saveFileLocally(transferId: String, fileName: String, data: ByteArray?): File {
         val dir = File(context.filesDir, "received_files")
         dir.mkdirs()
-        val file = File(dir, "${transferId}_${sanitizeFileName(fileName)}")
+        val file = File(dir, crypto.encryptedName("${transferId}_${sanitizeFileName(fileName)}"))
         if (data != null) {
-            file.writeBytes(data)
+            crypto.write(file, data)
         }
         return file
     }
@@ -721,9 +736,51 @@ class FileTransferManager(
     private fun saveThumbnailLocally(transferId: String, thumbnailBytes: ByteArray): String {
         val dir = File(context.filesDir, "thumbnails")
         dir.mkdirs()
-        val file = File(dir, "${transferId}_thumb.jpg")
-        file.writeBytes(thumbnailBytes)
+        val file = File(dir, crypto.encryptedName("${transferId}_thumb.jpg"))
+        crypto.write(file, thumbnailBytes)
         return file.absolutePath
+    }
+
+    /**
+     * One-time move of files stored before encryption: every message whose file or thumbnail is
+     * still a plain file gets it encrypted (`.enc`), and its path updated. A file that is being sent
+     * right now just fails that send; a retry picks up the new path.
+     */
+    suspend fun encryptLegacyFiles() {
+        for (msg in dao.getMessagesWithPlainFiles()) {
+            for ((path, isThumb) in listOf(msg.filePath to false, msg.thumbnailPath to true)) {
+                if (path == null || path.endsWith(FileCrypto.SUFFIX)) continue
+                val plain = File(path)
+                if (!plain.exists()) continue
+                try {
+                    val encrypted = crypto.encryptInPlace(plain)
+                    if (isThumb) dao.updateThumbnailPath(msg.messageId, encrypted.absolutePath)
+                    else dao.setLocalFilePath(msg.messageId, encrypted.absolutePath)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Couldn't encrypt ${plain.name}; it stays readable as a plain file", e)
+                }
+            }
+        }
+    }
+
+    /**
+     * A decrypted copy of a stored file in the share folder (cleared on every app start), for
+     * opening it in another app through FileProvider. Null if it can't be decrypted.
+     */
+    fun decryptedCopyForSharing(filePath: String, displayName: String?): File? {
+        val source = File(filePath)
+        if (!source.exists()) return null
+        val dir = File(context.cacheDir, "shared").apply { mkdirs() }
+        val name = FileCopy.suggestedName(displayName ?: source.name.removeSuffix(FileCrypto.SUFFIX))
+        val target = File(dir, "${System.nanoTime()}_$name")
+        return try {
+            crypto.decryptTo(source, target)
+            target
+        } catch (e: Exception) {
+            Log.e(TAG, "Couldn't decrypt ${source.name} for sharing", e)
+            target.delete()
+            null
+        }
     }
 
     /**
@@ -826,7 +883,8 @@ class FileTransferManager(
         if (!source.exists()) return false
         return try {
             val out = context.contentResolver.openOutputStream(destination, "w") ?: return false
-            out.use { output -> source.inputStream().use { input -> FileCopy.copy(input, output) } }
+            // Decrypts as it copies, so the saved copy is a normal file
+            out.use { output -> crypto.openRead(source).use { input -> FileCopy.copy(input, output) } }
             true
         } catch (e: Exception) {
             Log.e(TAG, "Save to device failed for $destination", e)

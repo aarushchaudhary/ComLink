@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
+import android.media.MediaDataSource
 import android.media.MediaPlayer
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -41,7 +42,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import androidx.compose.runtime.saveable.rememberSaveable
+import com.aarushchaudhary.comlink.ComLinkApp
 import com.aarushchaudhary.comlink.data.FileCopy
+import com.aarushchaudhary.comlink.data.FileCrypto
+import kotlinx.coroutines.CoroutineScope
+import java.nio.ByteBuffer
+import java.nio.channels.SeekableByteChannel
 import com.aarushchaudhary.comlink.data.MessageEntity
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -454,6 +460,49 @@ private class SaveAsDocument : ActivityResultContract<Pair<String, String>, Uri?
         if (resultCode == Activity.RESULT_OK) intent?.data else null
 }
 
+/**
+ * Opens a stored (encrypted) file in another app: decrypts it to a temporary copy in the share
+ * folder off the main thread (cleared on the next app start), then hands that over via FileProvider.
+ */
+private fun openInOtherApp(context: Context, scope: CoroutineScope, filePath: String, mimeType: String, name: String?) {
+    scope.launch {
+        val app = context.applicationContext as ComLinkApp
+        val copy = withContext(Dispatchers.IO) {
+            app.messagingEngine.fileTransferManager.decryptedCopyForSharing(filePath, name)
+        }
+        if (copy == null) {
+            android.widget.Toast.makeText(context, "Couldn't open this file", android.widget.Toast.LENGTH_SHORT).show()
+            return@launch
+        }
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", copy)
+            context.startActivity(Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, mimeType)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            })
+        } catch (e: Exception) {
+            android.widget.Toast.makeText(context, "No app can open this file", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+}
+
+/** Feeds MediaPlayer from a decrypting channel (MediaDataSource, API 23+). */
+private class DecryptingMediaDataSource(private val channel: SeekableByteChannel) : MediaDataSource() {
+    @Synchronized
+    override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+        if (size == 0) return 0
+        if (position >= channel.size()) return -1
+        channel.position(position)
+        return channel.read(ByteBuffer.wrap(buffer, offset, size))
+    }
+
+    @Synchronized
+    override fun getSize(): Long = channel.size()
+
+    @Synchronized
+    override fun close() = channel.close()
+}
+
 // ─── Image decoding (off the main thread, at a bounded size) ───────────
 
 private sealed interface DecodedImage {
@@ -471,23 +520,28 @@ private const val BUBBLE_IMAGE_MAX_PX = 1024
  */
 @Composable
 private fun rememberDecodedImage(path: String, maxPx: Int = BUBBLE_IMAGE_MAX_PX): DecodedImage {
+    val crypto = (LocalContext.current.applicationContext as ComLinkApp).fileCrypto
     val state = produceState<DecodedImage>(initialValue = DecodedImage.Loading, path) {
         value = withContext(Dispatchers.IO) {
-            decodeSampled(path, maxPx)?.let { DecodedImage.Ready(it.asImageBitmap()) } ?: DecodedImage.Failed
+            decodeSampled(crypto, path, maxPx)?.let { DecodedImage.Ready(it.asImageBitmap()) } ?: DecodedImage.Failed
         }
     }
     return state.value
 }
 
-private fun decodeSampled(path: String, maxPx: Int): android.graphics.Bitmap? = try {
+/** Two passes over the decrypted stream: size first, then a smaller decode. Nothing plain hits disk. */
+private fun decodeSampled(crypto: FileCrypto, path: String, maxPx: Int): android.graphics.Bitmap? = try {
+    val file = File(path)
     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeFile(path, bounds)
+    crypto.openRead(file).use { BitmapFactory.decodeStream(it, null, bounds) }
     if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
         null
     } else {
         var sampleSize = 1
         while (maxOf(bounds.outWidth, bounds.outHeight) / sampleSize > maxPx) sampleSize *= 2
-        BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sampleSize })
+        crypto.openRead(file).use {
+            BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sampleSize })
+        }
     }
 } catch (e: Exception) {
     null
@@ -566,7 +620,14 @@ private fun AudioMessageContent(msg: MessageEntity, accentColor: Color) {
                             isPlaying = true
                             try {
                                 val player = MediaPlayer()
-                                player.setDataSource(filePath)
+                                val crypto = (context.applicationContext as ComLinkApp).fileCrypto
+                                val file = File(filePath)
+                                if (crypto.isEncrypted(file)) {
+                                    // Decrypted on the fly while playing; no plain copy on disk
+                                    player.setDataSource(DecryptingMediaDataSource(crypto.openSeekable(file)))
+                                } else {
+                                    player.setDataSource(filePath)
+                                }
                                 player.prepare()
                                 player.setOnCompletionListener {
                                     isPlaying = false
@@ -613,6 +674,7 @@ private fun AudioMessageContent(msg: MessageEntity, accentColor: Color) {
 @Composable
 private fun DocumentMessageContent(msg: MessageEntity, accentColor: Color) {
     val context = LocalContext.current
+    val openScope = rememberCoroutineScope()
     val filePath = msg.filePath
     val fileExists = filePath != null && File(filePath).exists()
 
@@ -621,21 +683,7 @@ private fun DocumentMessageContent(msg: MessageEntity, accentColor: Color) {
             .widthIn(max = 260.dp)
             .then(
                 if (fileExists) Modifier.clickable {
-                    try {
-                        val file = File(filePath!!)
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            file
-                        )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, msg.fileMimeType ?: "*/*")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(intent)
-                    } catch (e: Exception) {
-                        // No app to handle this file type
-                    }
+                    openInOtherApp(context, openScope, filePath!!, msg.fileMimeType ?: "*/*", msg.fileName)
                 } else Modifier
             )
             .padding(vertical = 4.dp),
@@ -746,6 +794,7 @@ private fun formatFileSize(bytes: Long): String {
 @Composable
 private fun VideoMessageContent(msg: MessageEntity, accentColor: Color, backgroundColor: Color) {
     val context = LocalContext.current
+    val openScope = rememberCoroutineScope()
     val filePath = msg.filePath
     val fileExists = filePath != null && File(filePath).exists()
 
@@ -756,19 +805,7 @@ private fun VideoMessageContent(msg: MessageEntity, accentColor: Color, backgrou
             .clip(RoundedCornerShape(2.dp))
             .then(
                 if (fileExists) Modifier.clickable {
-                    try {
-                        val file = File(filePath!!)
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            file
-                        )
-                        val intent = Intent(Intent.ACTION_VIEW).apply {
-                            setDataAndType(uri, msg.fileMimeType ?: "video/*")
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(intent)
-                    } catch (e: Exception) {}
+                    openInOtherApp(context, openScope, filePath!!, msg.fileMimeType ?: "video/*", msg.fileName)
                 } else Modifier
             )
             .background(Color.DarkGray)

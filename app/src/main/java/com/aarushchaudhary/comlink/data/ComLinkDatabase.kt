@@ -129,6 +129,10 @@ interface ComLinkDao {
     @Query("DELETE FROM messages WHERE messageId = :messageId")
     suspend fun deleteMessage(messageId: String)
 
+    /** Messages whose file or thumbnail is still stored unencrypted (from before Phase 11). */
+    @Query("SELECT * FROM messages WHERE (filePath IS NOT NULL AND filePath NOT LIKE '%.enc') OR (thumbnailPath IS NOT NULL AND thumbnailPath NOT LIKE '%.enc')")
+    suspend fun getMessagesWithPlainFiles(): List<MessageEntity>
+
     /** The sender's own file message, after its image was converted (e.g. PNG -> JPEG). */
     @Query("UPDATE messages SET fileName = :fileName, fileMimeType = :mimeType, fileSize = :fileSize WHERE messageId = :messageId")
     suspend fun updateFileMeta(messageId: String, fileName: String, mimeType: String, fileSize: Long)

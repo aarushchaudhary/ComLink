@@ -88,7 +88,8 @@ class MessagingEngine(
         context = app,
         dao = dao,
         sender = sender,
-        scope = scope
+        scope = scope,
+        crypto = app.fileCrypto
     )
 
     init {
@@ -115,6 +116,9 @@ class MessagingEngine(
             }
         }
         
+        // Files stored before encryption existed: encrypt them once, in the background
+        scope.launch(Dispatchers.IO) { fileTransferManager.encryptLegacyFiles() }
+
         // Presence Monitor
         scope.launch(Dispatchers.IO) {
             while (isActive) {
