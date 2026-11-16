@@ -27,10 +27,14 @@ object QrUtils {
         return bitmap
     }
 
-    fun decodeQr(yuvData: ByteArray, width: Int, height: Int): String? {
+    /**
+     * Decodes a QR code from a camera luminance (Y) plane.
+     * @param rowStride bytes per row in [yuvData]; many phones pad rows, so it can exceed [width]
+     */
+    fun decodeQr(yuvData: ByteArray, rowStride: Int, width: Int, height: Int): String? {
         try {
             val source = PlanarYUVLuminanceSource(
-                yuvData, width, height, 0, 0, width, height, false
+                yuvData, rowStride, height, 0, 0, width, height, false
             )
             val binaryBitmap = BinaryBitmap(HybridBinarizer(source))
             val result = MultiFormatReader().decode(binaryBitmap)

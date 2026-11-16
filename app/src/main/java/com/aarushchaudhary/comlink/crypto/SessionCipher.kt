@@ -69,6 +69,19 @@ class SessionCipher(
         }
 
         private val AAD_LABEL = "ComLink-envelope-v1".toByteArray(Charsets.UTF_8)
+
+        /**
+         * Compares byte arrays as unsigned bytes, then by length. Both phones use it to order their
+         * two public keys the same way (direction bytes here, fingerprints in IdentityManager).
+         */
+        internal fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
+            for (i in 0 until minOf(a.size, b.size)) {
+                val aByte = a[i].toInt() and 0xFF
+                val bByte = b[i].toInt() and 0xFF
+                if (aByte != bByte) return aByte.compareTo(bByte)
+            }
+            return a.size.compareTo(b.size)
+        }
     }
 
     /**
@@ -138,16 +151,7 @@ class SessionCipher(
         buffer.put((counter shr 16 and 0xFF).toByte())
         buffer.put((counter shr 8 and 0xFF).toByte())
         buffer.put((counter and 0xFF).toByte())
-        
-        return buffer.array()
-    }
 
-    private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
-        for (i in 0 until minOf(a.size, b.size)) {
-            val aByte = a[i].toInt() and 0xFF
-            val bByte = b[i].toInt() and 0xFF
-            if (aByte != bByte) return aByte.compareTo(bByte)
-        }
-        return a.size.compareTo(b.size)
+        return buffer.array()
     }
 }

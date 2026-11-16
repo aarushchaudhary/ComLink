@@ -82,7 +82,7 @@ class IdentityManager(private val context: Context) {
         val md = MessageDigest.getInstance("SHA-256")
         
         // Sort to ensure determinism
-        val isMyKeyFirst = compareByteArrays(myPubKey, peerPublicKey) <= 0
+        val isMyKeyFirst = SessionCipher.compareByteArrays(myPubKey, peerPublicKey) <= 0
         if (isMyKeyFirst) {
             md.update(myPubKey)
             md.update(peerPublicKey)
@@ -96,14 +96,5 @@ class IdentityManager(private val context: Context) {
         // Format as a hex string grouped for easy reading (e.g., "A1B2-C3D4-...")
         val hex = hash.joinToString("") { "%02X".format(it) }
         return hex.chunked(4).joinToString("-")
-    }
-
-    private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
-        for (i in 0 until minOf(a.size, b.size)) {
-            val aByte = a[i].toInt() and 0xFF
-            val bByte = b[i].toInt() and 0xFF
-            if (aByte != bByte) return aByte.compareTo(bByte)
-        }
-        return a.size.compareTo(b.size)
     }
 }

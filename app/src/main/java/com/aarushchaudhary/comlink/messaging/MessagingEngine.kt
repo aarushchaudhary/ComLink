@@ -375,7 +375,7 @@ class MessagingEngine(
                 dao.updatePeerReplayState(senderId, window.highest, window.toBytes())
 
                 // Route based on content_type
-                val contentType = envelope.content_type ?: 0
+                val contentType = envelope.content_type ?: FileTransferManager.CONTENT_TYPE_MESSAGE
                 when (contentType) {
                     FileTransferManager.CONTENT_TYPE_FILE_HEADER -> {
                         fileTransferManager.onFileHeaderReceived(senderId, decryptedBytes)

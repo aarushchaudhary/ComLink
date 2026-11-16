@@ -71,7 +71,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
     implementation("androidx.activity:activity-compose:1.9.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     
     // Compose
@@ -98,8 +97,7 @@ dependencies {
     // ZXing (QR Generation & Parsing)
     implementation("com.google.zxing:core:3.5.3")
 
-    // Square Wire (Protobuf)
-    implementation("com.squareup.wire:wire-runtime:4.9.9")
+    // Square Wire (Protobuf): the Wire Gradle plugin adds wire-runtime at its own version
 
     // Tests
     testImplementation("junit:junit:4.13.2")

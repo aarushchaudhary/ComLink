@@ -95,9 +95,6 @@ interface ComLinkDao {
     @Query("SELECT * FROM peers")
     fun getAllPeers(): Flow<List<PeerEntity>>
 
-    @Query("SELECT * FROM peers")
-    suspend fun getAllPeersSync(): List<PeerEntity>
-
     @Query("SELECT * FROM peers WHERE isDirectlyConnected = 1")
     suspend fun getConnectedPeers(): List<PeerEntity>
 
@@ -129,6 +126,8 @@ interface ComLinkDao {
     @Query("SELECT * FROM messages WHERE messageId = :messageId LIMIT 1")
     suspend fun getMessage(messageId: String): MessageEntity?
 
+    // Current code never stores ACKs, but app versions before ACK support stored a newer phone's
+    // "ACK:<id>" as an ordinary text; this keeps those old rows hidden
     @Query("SELECT * FROM messages WHERE deviceId = :deviceId AND plaintext NOT LIKE 'ACK:%' ORDER BY timestamp ASC")
     fun getMessagesForPeer(deviceId: String): Flow<List<MessageEntity>>
 
